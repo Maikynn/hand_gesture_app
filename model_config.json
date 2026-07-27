@@ -1,0 +1,25 @@
+{
+  "static_models": {
+    "mobilenet_v3": {
+      "name": "HaGRID MobileNetV3",
+      "path": "F:/MODELS/Model_lerning/hagrid_mixed_geometry_tune/weights best/pt",
+      "type": "mobilenet"
+    },
+    "yolo_v8": {
+      "name": "HaGRID YOLOv8",
+      "path": "F:/MODELS/Model_lerning/mobilenet_v3_static/weights",
+      "type": "yolo"
+    },
+    "combined": {
+      "name": "Объединённая (MobileNetV3 + YOLO)",
+      "type": "combined"
+    }
+  },
+  "dynamic_models": {
+    "jester_lstm": {
+      "name": "Jester LSTM (динамические жесты)",
+      "path": "F:/MODELS/jester_lstm",
+      "type": "lstm"
+    }
+  }
+}

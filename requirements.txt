@@ -1,0 +1,16 @@
+opencv-python
+mediapipe
+numpy
+pyqt5
+speech_recognition
+pyttsx3
+requests
+onnxruntime
+tensorflow
+torch
+torchaudio
+vosk
+pyaudio
+faster-whisper
+silero
+sounddevice

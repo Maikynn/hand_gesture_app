@@ -1,0 +1,61 @@
+{
+  "camera": {
+    "device_index": 1,
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "show_face": true,
+    "show_hands": true,
+    "show_eyes": true,
+    "show_brows": true,
+    "show_lips": true,
+    "show_fingers": true,
+    "show_palm": true,
+    "brightness": 4,
+    "contrast": 1.0,
+    "flip": true
+  },
+  "gesture": {
+    "model_path": "",
+    "confidence_threshold": 0.85,
+    "hand_crop_size": 150,
+    "hand_crop_padding": 30,
+    "palm_side_detection": true,
+    "static_model_id": "yolo_v8"
+  },
+  "voice": {
+    "enabled": true,
+    "wake_word": "аксиос",
+    "wake_threshold": 0.75,
+    "samples_dir": "C:\\Users\\Nikolay\\Desktop\\hand_gesture_app\\wake_samples",
+    "stt_engine": "whisper",
+    "whisper_model": "bond005/whisper-podlodka-turbo",
+    "stt_cloud_url": "",
+    "stt_cloud_key": "",
+    "tts_engine": "silero",
+    "tts_speaker": "xenia",
+    "xtts_voice": "",
+    "llm_engine": "openrouter",
+    "openrouter_key": "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",
+    "openrouter_model": "qwen/qwen3-coder:free",
+    "ollama_url": "http://localhost:11434",
+    "ollama_model": "tom_himanen/deepseek-r1-roo-cline-tools:8b",
+    "system_prompt": "Ты — голосовой помощник Акси. Отвечай кратко и по делу на русском.",
+    "max_tokens": 200,
+    "volume_step": 10,
+    "mic_index": 1,
+    "vosk_model_path": "C:\\Users\\Nikolay\\Desktop\\hand_gesture_app\\models\\vosk-ru",
+    "tts_voice": "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens\\TTS_MS_EN-US_ZIRA_11.0",
+    "tts_rate": 196,
+    "mic_gain": 10.0,
+    "openrouter_fallback_models": [
+      "qwen/qwen3-coder:"
+    ]
+  },
+  "models": {
+    "static_model_path": "F:\\MODELS\\Model_lerning\\hagrid_mixed_geometry_tune\\weights best\\pt",
+    "dynamic_model_path": "F:\\MODELS\\Model_lerning\\dynamic_model.pth",
+    "device": "cpu",
+    "dynamic_threshold": 0.6
+  }
+}
