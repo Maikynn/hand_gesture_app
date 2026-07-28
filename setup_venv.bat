@@ -43,6 +43,13 @@ if not exist "models\whisper\tiny\model.bin" (
   if errorlevel 1 exit /b 1
 )
 
+if not exist "models\silero\v5_5_ru.pt" (
+  echo Downloading the high-quality Russian Silero v5.5 voice...
+  if not exist "models\silero" mkdir "models\silero"
+  "venv\Scripts\python.exe" -c "import torch; torch.hub.download_url_to_file('https://models.silero.ai/models/tts/ru/v5_5_ru.pt', 'models/silero/v5_5_ru.pt', progress=True)"
+  if errorlevel 1 exit /b 1
+)
+
 echo.
 echo [OK] Axi Control is ready. Start it with run.bat.
 endlocal

@@ -14,9 +14,10 @@ from camera.skeleton_renderer import SkeletonRenderer
 from hand_processing.gesture_fusion import HAGRID_CLASSES
 from hand_processing.static_yolo import DEFAULT_YOLO_MODEL, YOLOStaticModel
 
-from PyQt5.QtWidgets import QApplication, QLabel
+from PyQt5.QtCore import QEvent
+from PyQt5.QtWidgets import QApplication, QComboBox, QLabel, QSlider, QSpinBox
 
-from ui.main_window import CameraWidget
+from ui.main_window import CameraWidget, ParameterWheelGuard
 
 
 class CameraStabilityTests(unittest.TestCase):
@@ -60,6 +61,23 @@ class CameraStabilityTests(unittest.TestCase):
         self.assertIsNotNone(probabilities)
         self.assertEqual(probabilities.shape, (len(HAGRID_CLASSES),))
         self.assertTrue(np.isfinite(probabilities).all())
+
+    def test_mouse_wheel_cannot_change_parameter_controls(self):
+        class WheelEvent:
+            ignored = False
+
+            @staticmethod
+            def type():
+                return QEvent.Wheel
+
+            def ignore(self):
+                self.ignored = True
+
+        guard = ParameterWheelGuard()
+        for control in (QComboBox(), QSpinBox(), QSlider()):
+            event = WheelEvent()
+            self.assertTrue(guard.eventFilter(control, event))
+            self.assertTrue(event.ignored)
 
 
 if __name__ == "__main__":

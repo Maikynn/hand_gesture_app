@@ -16,3 +16,4 @@ build/
 user_data/
 models/piper/
 models/whisper/
+models/silero/

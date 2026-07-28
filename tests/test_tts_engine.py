@@ -102,6 +102,33 @@ class TTSEngineTests(unittest.TestCase):
         offline.assert_not_called()
         self.assertTrue(any(state == "error" for state, _ in events))
 
+    @patch("threading.Thread.start")
+    def test_silero_never_silently_becomes_windows_voice(self, _start):
+        events = []
+        tts = TTSEngine(
+            engine="silero",
+            voice_id="eugene",
+            fallback_engine="none",
+            on_event=lambda state, message: events.append((state, message)),
+        )
+        request = SpeechRequest(
+            text="Проверка русского голоса",
+            generation=0,
+            engine="silero",
+            voice_id="eugene",
+            rate=175,
+            volume=0.9,
+            pitch=0,
+            fallback_engine="none",
+        )
+        with (
+            patch.object(tts, "_speak_silero", side_effect=RuntimeError("broken")),
+            patch.object(tts, "_speak_offline") as offline,
+        ):
+            tts._speak(request)
+        offline.assert_not_called()
+        self.assertTrue(any(state == "error" for state, _ in events))
+
 
 if __name__ == "__main__":
     unittest.main()

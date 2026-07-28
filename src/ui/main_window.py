@@ -17,9 +17,10 @@ from camera.skeleton_renderer import SkeletonRenderer
 from assistant import tts_engine as _tts_runtime  # noqa: F401
 from faster_whisper import WhisperModel as _whisper_runtime  # noqa: F401
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QImage, QKeySequence, QPixmap
+from PyQt5.QtCore import QEvent, QObject, QRectF, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
+    QAbstractSpinBox,
     QAbstractItemView,
     QAction,
     QApplication,
@@ -126,16 +127,69 @@ GESTURES = [
 ]
 
 
+class ParameterWheelGuard(QObject):
+    """Keep accidental wheel scrolling from changing focused controls."""
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.Wheel and isinstance(
+            watched, (QComboBox, QAbstractSpinBox, QSlider)
+        ):
+            event.ignore()
+            return True
+        return super().eventFilter(watched, event)
+
+
+class JarvisOrb(QWidget):
+    """Small, lightweight HUD reactor drawn entirely by Qt."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(112, 112)
+        self._phase = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(45)
+
+    def _tick(self) -> None:
+        self._phase = (self._phase + 2) % 360
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        center = self.rect().center()
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(35, 224, 255, 22))
+        painter.drawEllipse(center, 34, 34)
+        painter.setBrush(QColor(67, 232, 255, 40))
+        painter.drawEllipse(center, 22, 22)
+        rings = (
+            (QRectF(8, 8, 96, 96), self._phase * 16, 96 * 16, 2),
+            (QRectF(18, 18, 76, 76), -self._phase * 16, 126 * 16, 3),
+            (QRectF(29, 29, 54, 54), (self._phase * 2) * 16, 172 * 16, 2),
+        )
+        for bounds, start, span, width in rings:
+            painter.setPen(QPen(QColor("#39dff5"), width))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawArc(bounds, int(start), int(span))
+            painter.drawArc(bounds, int(start + 190 * 16), int(span // 2))
+        painter.setPen(QPen(QColor("#d8fbff"), 1))
+        painter.drawEllipse(center, 8, 8)
+        painter.setPen(QColor("#74edff"))
+        painter.drawText(self.rect(), Qt.AlignCenter, "AI")
+
+
 class HandPreview(QFrame):
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
         self.setObjectName("Card")
+        self.setFixedSize(340, 150)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         self.image = QLabel("Рука не обнаружена")
         self.image.setObjectName("HandSurface")
         self.image.setAlignment(Qt.AlignCenter)
-        self.image.setFixedSize(154, 124)
+        self.image.setFixedSize(164, 124)
         self.text = QLabel(f"{title}: —")
         self.text.setStyleSheet("font-size: 13pt; font-weight: 650;")
         self.text.setWordWrap(True)
@@ -152,7 +206,7 @@ class HandPreview(QFrame):
             f"{title}: {GESTURE_LABELS.get(gesture, gesture)}\n"
             f"<span style='font-size:9pt;color:#8f9bb3'>{confidence:.0%}</span>"
         )
-        CameraWidget.set_image(self.image, crop)
+        CameraWidget.set_image(self.image, crop, allow_upscale=False)
 
 
 class GestureBindingsPanel(QFrame):
@@ -367,22 +421,28 @@ class CameraWidget(QWidget):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         body = QWidget()
+        body.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout = QVBoxLayout(body)
         layout.setContentsMargins(28, 24, 28, 28)
         layout.setSpacing(14)
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("Камера")
+        title = QLabel("CAMERA // LIVE")
         title.setObjectName("PageTitle")
-        subtitle = QLabel("Покажи руки — Jarvis распознает жесты и выполнит только разрешённые действия")
+        subtitle = QLabel("Основной видеоканал и быстрые параметры распознавания")
         subtitle.setObjectName("PageSubtitle")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         header.addLayout(title_box, 1)
+        layout.addLayout(header)
+
+        quick = QHBoxLayout()
         self.performance_status = QLabel("Ожидание кадра")
         self.performance_status.setObjectName("StatusNeutral")
-        header.addWidget(self.performance_status)
+        self.performance_status.setMaximumWidth(180)
+        quick.addWidget(self.performance_status)
+        quick.addStretch(1)
         self.actions_toggle = QPushButton("Управление жестами: выкл")
         self.actions_toggle.setCheckable(True)
         self.actions_toggle.setChecked(bool(self.settings.get("actions_enabled", False)))
@@ -392,38 +452,49 @@ class CameraWidget(QWidget):
         )
         self.actions_toggle.toggled.connect(self._toggle_actions)
         self._set_actions_toggle_text(self.actions_toggle.isChecked())
-        header.addWidget(self.actions_toggle)
+        quick.addWidget(self.actions_toggle)
         self.pause_button = QPushButton("Пауза")
         self.pause_button.setProperty("secondary", True)
         self.pause_button.clicked.connect(self._toggle_camera_pause)
-        header.addWidget(self.pause_button)
+        quick.addWidget(self.pause_button)
         self.camera_status = QLabel("Камера подключена" if self.video_capture.is_open else "Нет камеры")
         self.camera_status.setObjectName(
             "StatusGood" if self.video_capture.is_open else "StatusBad"
         )
-        header.addWidget(self.camera_status)
-        layout.addLayout(header)
+        self.camera_status.setMaximumWidth(280)
+        self.camera_status.setWordWrap(True)
+        quick.addWidget(self.camera_status)
+        layout.addLayout(quick)
 
         self.video = QLabel("Подключаю камеру…")
         self.video.setObjectName("VideoSurface")
         self.video.setAlignment(Qt.AlignCenter)
-        self.video.setMinimumSize(760, 440)
-        self.video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        layout.addWidget(self.video, 1)
+        self.video.setFixedSize(820, 461)
+        video_row = QHBoxLayout()
+        video_row.addStretch(1)
+        video_row.addWidget(self.video)
+        video_row.addStretch(1)
+        layout.addLayout(video_row)
 
         hands = QHBoxLayout()
         hands.setSpacing(14)
         self.left_hand = HandPreview("Левая")
         self.right_hand = HandPreview("Правая")
+        hands.addStretch(1)
         hands.addWidget(self.left_hand)
         hands.addWidget(self.right_hand)
+        hands.addStretch(1)
         layout.addLayout(hands)
         layout.addWidget(self._controls())
-        layout.addWidget(self._advanced_controls())
+        layout.addStretch(1)
+
+        # These panels live on the separate Camera Lab page, but remain owned by
+        # CameraWidget so the recognition pipeline can use the same controls.
+        self.model_details_card = self._model_details_controls()
+        self.advanced_card = self._advanced_controls()
         self.bindings_panel = GestureBindingsPanel(self.store, self.executor)
         self.bindings_panel.saved.connect(self._reload_bindings)
-        layout.addWidget(self.bindings_panel)
-        layout.addWidget(self._history_panel())
+        self.history_panel = self._history_panel()
         scroll.setWidget(body)
         root.addWidget(scroll)
 
@@ -451,22 +522,6 @@ class CameraWidget(QWidget):
         self.model_combo.currentIndexChanged.connect(self._model_selection_changed)
         form.addRow("Модель", self.model_combo)
 
-        model_path_row = QHBoxLayout()
-        initial_model = str(self.model_combo.currentData())
-        initial_path = (
-            self.settings.get("yolo_model_path", DEFAULT_YOLO_MODEL)
-            if initial_model == "yolo"
-            else self.settings.get("custom_model_path", "")
-        )
-        self.model_path = QLineEdit(str(initial_path))
-        self.choose_model_button = QPushButton("…")
-        self.choose_model_button.setFixedWidth(42)
-        self.choose_model_button.setProperty("secondary", True)
-        self.choose_model_button.clicked.connect(self._choose_model)
-        model_path_row.addWidget(self.model_path, 1)
-        model_path_row.addWidget(self.choose_model_button)
-        form.addRow("Файл модели", model_path_row)
-        self._sync_model_path_controls()
         row.addLayout(form, 2)
 
         sliders = QFormLayout()
@@ -475,26 +530,64 @@ class CameraWidget(QWidget):
         self.brightness.setValue(int(self.settings.get("brightness", 0)))
         self.brightness.valueChanged.connect(self._save_camera_controls)
         sliders.addRow("Яркость", self.brightness)
-        self.padding = QSlider(Qt.Horizontal)
-        self.padding.setRange(5, 80)
-        self.padding.setValue(int(self.settings.get("crop_padding", 34)))
-        self.padding.valueChanged.connect(self._save_camera_controls)
-        sliders.addRow("Отступ руки", self.padding)
         row.addLayout(sliders, 2)
 
         toggles = QVBoxLayout()
         self.mirror = QCheckBox("Зеркальное изображение")
+        self.mirror.setChecked(bool(self.settings.get("mirror", True)))
+        self.mirror.toggled.connect(self._save_camera_controls)
+        toggles.addWidget(self.mirror)
+        basic_hint = QLabel("Остальные параметры —\nв CAMERA LAB")
+        basic_hint.setProperty("muted", True)
+        toggles.addWidget(basic_hint)
+        row.addLayout(toggles, 1)
+        return card
+
+    def _model_details_controls(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("Card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 16, 16, 16)
+        title = QLabel("Видеопоток и визуализация")
+        title.setObjectName("SectionTitle")
+        layout.addWidget(title)
+        row = QHBoxLayout()
+
+        form = QFormLayout()
+        model_path_row = QHBoxLayout()
+        initial_model = str(self.model_combo.currentData())
+        initial_path = (
+            self.settings.get("yolo_model_path", DEFAULT_YOLO_MODEL)
+            if initial_model == "yolo"
+            else self.settings.get("custom_model_path", "")
+        )
+        self.model_path = QLineEdit(str(initial_path))
+        self.choose_model_button = QPushButton("Выбрать…")
+        self.choose_model_button.setProperty("secondary", True)
+        self.choose_model_button.clicked.connect(self._choose_model)
+        model_path_row.addWidget(self.model_path, 1)
+        model_path_row.addWidget(self.choose_model_button)
+        form.addRow("Файл модели", model_path_row)
+        self.padding = QSlider(Qt.Horizontal)
+        self.padding.setRange(5, 80)
+        self.padding.setValue(int(self.settings.get("crop_padding", 34)))
+        self.padding.valueChanged.connect(self._save_camera_controls)
+        form.addRow("Отступ руки", self.padding)
+        row.addLayout(form, 2)
+
+        toggles = QVBoxLayout()
         self.show_hands = QCheckBox("Рисовать скелет рук")
         self.show_face = QCheckBox("Сетка лица")
         self.show_pose = QCheckBox("Скелет тела")
-        self.mirror.setChecked(bool(self.settings.get("mirror", True)))
         self.show_hands.setChecked(bool(self.settings.get("show_hands", True)))
         self.show_face.setChecked(bool(self.settings.get("show_face", False)))
         self.show_pose.setChecked(bool(self.settings.get("show_pose", False)))
-        for widget in (self.mirror, self.show_hands, self.show_face, self.show_pose):
+        for widget in (self.show_hands, self.show_face, self.show_pose):
             widget.toggled.connect(self._save_camera_controls)
             toggles.addWidget(widget)
         row.addLayout(toggles, 1)
+        layout.addLayout(row)
+        self._sync_model_path_controls()
         return card
 
     def _advanced_controls(self) -> QFrame:
@@ -1392,15 +1485,21 @@ class CameraWidget(QWidget):
         self.status_changed.emit(level, text)
 
     @staticmethod
-    def set_image(label: QLabel, rgb: np.ndarray) -> None:
+    def set_image(
+        label: QLabel, rgb: np.ndarray, *, allow_upscale: bool = True
+    ) -> None:
         rgb = np.require(rgb, dtype=np.uint8, requirements=["C"])
         height, width, channels = rgb.shape
         image = QImage(
             rgb.data, width, height, int(rgb.strides[0]), QImage.Format_RGB888
         ).copy()
+        target = label.size()
+        if not allow_upscale:
+            target.setWidth(min(target.width(), width))
+            target.setHeight(min(target.height(), height))
         label.setPixmap(
             QPixmap.fromImage(image).scaled(
-                label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                target, Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
         )
 
@@ -1408,6 +1507,39 @@ class CameraWidget(QWidget):
         self.stop()
         self.video_capture.release()
         self.renderer.release()
+
+
+class CameraLabWidget(QWidget):
+    """Advanced camera tools separated from the live monitoring view."""
+
+    def __init__(self, camera: CameraWidget, parent=None):
+        super().__init__(parent)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        body = QWidget()
+        body.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(28, 24, 28, 28)
+        layout.setSpacing(14)
+        title = QLabel("CAMERA LAB // CONFIG")
+        title.setObjectName("PageTitle")
+        subtitle = QLabel(
+            "Модели, ROI, обучение, привязки жестов и журнал распознавания"
+        )
+        subtitle.setObjectName("PageSubtitle")
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addWidget(camera.model_details_card)
+        layout.addWidget(camera.advanced_card)
+        layout.addWidget(camera.bindings_panel)
+        layout.addWidget(camera.history_panel)
+        layout.addStretch(1)
+        scroll.setWidget(body)
+        root.addWidget(scroll)
 
 
 class MainWindow(QMainWindow):
@@ -1423,9 +1555,12 @@ class MainWindow(QMainWindow):
 
         self.camera_page = CameraWidget(self.store)
         self.assistant_page = AssistantWindow(self.store)
+        self.camera_lab_page = CameraLabWidget(self.camera_page)
         self.stack = QStackedWidget()
         self.stack.addWidget(self.camera_page)
         self.stack.addWidget(self.assistant_page)
+        self.stack.addWidget(self.camera_lab_page)
+        self.stack.addWidget(self.assistant_page.advanced_settings_page)
         self._build_shell()
         self._install_shortcuts()
         self._setup_tray()
@@ -1446,33 +1581,65 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
         sidebar = QWidget()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(230)
+        sidebar.setFixedWidth(208)
         side = QVBoxLayout(sidebar)
-        side.setContentsMargins(18, 22, 18, 20)
-        side.setSpacing(9)
-        brand = QLabel("AXI CONTROL")
+        side.setContentsMargins(16, 18, 16, 18)
+        side.setSpacing(7)
+        brand = QLabel("J.A.R.V.I.S")
         brand.setObjectName("Brand")
-        caption = QLabel("Жесты + Jarvis")
+        brand.setAlignment(Qt.AlignCenter)
+        caption = QLabel("AXI // CONTROL SYSTEM")
         caption.setObjectName("BrandCaption")
+        caption.setAlignment(Qt.AlignCenter)
         side.addWidget(brand)
         side.addWidget(caption)
-        side.addSpacing(20)
-        self.camera_button = QPushButton("◉  Камера\nжесты и действия")
-        self.assistant_button = QPushButton("✦  Помощник\nчат и настройки")
-        for button in (self.camera_button, self.assistant_button):
+        orb_row = QHBoxLayout()
+        orb_row.addStretch(1)
+        orb_row.addWidget(JarvisOrb())
+        orb_row.addStretch(1)
+        side.addLayout(orb_row)
+        self.core_status = QLabel("● CORE ONLINE")
+        self.core_status.setObjectName("CoreStatus")
+        self.core_status.setAlignment(Qt.AlignCenter)
+        side.addWidget(self.core_status)
+        side.addSpacing(10)
+        self.camera_button = QPushButton("01  CAMERA")
+        self.assistant_button = QPushButton("02  ASSISTANT")
+        self.camera_lab_button = QPushButton("03  CAMERA LAB")
+        self.jarvis_core_button = QPushButton("04  JARVIS CORE")
+        self._page_buttons = (
+            self.camera_button,
+            self.assistant_button,
+            self.camera_lab_button,
+            self.jarvis_core_button,
+        )
+        for button in self._page_buttons:
             button.setCheckable(True)
-            button.setMinimumHeight(60)
-            button.setProperty("secondary", True)
+            button.setMinimumHeight(46)
+            button.setObjectName("NavButton")
             side.addWidget(button)
         self.camera_button.setChecked(True)
         self.camera_button.clicked.connect(lambda: self._show_page(0))
         self.assistant_button.clicked.connect(lambda: self._show_page(1))
+        self.camera_lab_button.clicked.connect(lambda: self._show_page(2))
+        self.jarvis_core_button.clicked.connect(lambda: self._show_page(3))
         side.addStretch(1)
-        shortcuts = QLabel("Ctrl+1  Камера\nCtrl+2  Помощник\nCtrl+T  Тема\nCtrl+P  Пауза")
+        self.clock_label = QLabel()
+        self.clock_label.setObjectName("HudClock")
+        self.clock_label.setAlignment(Qt.AlignCenter)
+        side.addWidget(self.clock_label)
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._update_clock)
+        self._clock_timer.start(1000)
+        self._update_clock()
+        shortcuts = QLabel(
+            "CTRL 1—4  НАВИГАЦИЯ\nCTRL+T  ТЕМА\nCTRL+P  ПАУЗА"
+        )
         shortcuts.setProperty("muted", True)
         shortcuts.setToolTip("Быстрые клавиши доступны из любой вкладки")
+        shortcuts.setAlignment(Qt.AlignCenter)
         side.addWidget(shortcuts)
-        self.theme_button = QPushButton("☀ Светлая тема")
+        self.theme_button = QPushButton("LIGHT MODE")
         self.theme_button.setProperty("secondary", True)
         self.theme_button.clicked.connect(self._toggle_theme)
         side.addWidget(self.theme_button)
@@ -1485,10 +1652,15 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self._sync_theme_button()
 
+    def _update_clock(self) -> None:
+        self.clock_label.setText(time.strftime("%H:%M:%S\n%d.%m.%Y"))
+
     def _install_shortcuts(self) -> None:
         bindings = (
             ("Ctrl+1", lambda: self._show_page(0)),
             ("Ctrl+2", lambda: self._show_page(1)),
+            ("Ctrl+3", lambda: self._show_page(2)),
+            ("Ctrl+4", lambda: self._show_page(3)),
             ("Ctrl+T", self._toggle_theme),
             ("Ctrl+P", self.camera_page._toggle_camera_pause),
         )
@@ -1564,8 +1736,8 @@ class MainWindow(QMainWindow):
 
     def _show_page(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
-        self.camera_button.setChecked(index == 0)
-        self.assistant_button.setChecked(index == 1)
+        for button_index, button in enumerate(self._page_buttons):
+            button.setChecked(index == button_index)
 
     def _toggle_theme(self) -> None:
         current = str(self.store.get("ui.theme", "dark"))
@@ -1579,7 +1751,7 @@ class MainWindow(QMainWindow):
 
     def _sync_theme_button(self) -> None:
         dark = str(self.store.get("ui.theme", "dark")) == "dark"
-        self.theme_button.setText("☀ Светлая тема" if dark else "☾ Тёмная тема")
+        self.theme_button.setText("LIGHT MODE" if dark else "DARK MODE")
 
     def _status(self, level: str, text: str) -> None:
         names = {"good": "StatusGood", "warn": "StatusWarn", "bad": "StatusBad"}
@@ -1610,6 +1782,9 @@ class MainWindow(QMainWindow):
 def main() -> None:
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    wheel_guard = ParameterWheelGuard(app)
+    app.installEventFilter(wheel_guard)
+    app._parameter_wheel_guard = wheel_guard
     window = MainWindow()
     window.show()
     # Let Ctrl+C from run.bat close native camera/MediaPipe resources cleanly.

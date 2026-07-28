@@ -22,9 +22,9 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
-    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
@@ -39,6 +39,7 @@ from assistant.listener import WakeWordListener
 from assistant.tts_engine import (
     NEURAL_VOICES,
     PIPER_VOICES,
+    SILERO_VOICES,
     TTSEngine,
     list_voices,
 )
@@ -64,7 +65,7 @@ class AssistantSignals(QObject):
 
 
 class AssistantWindow(QWidget):
-    """Chat, voice, permissions and command settings in one assistant tab."""
+    """Minimal chat view with a separate advanced JARVIS Core page."""
 
     status_changed = pyqtSignal(str, str)
 
@@ -79,8 +80,8 @@ class AssistantWindow(QWidget):
         assistant = self.store.get("assistant", {}) or {}
         self.signals = AssistantSignals()
         self.tts = TTSEngine(
-            engine=str(assistant.get("tts_engine", "piper")),
-            voice_id=str(assistant.get("tts_voice", "ru_RU-denis-medium")),
+            engine=str(assistant.get("tts_engine", "silero")),
+            voice_id=str(assistant.get("tts_voice", "eugene")),
             rate=int(assistant.get("tts_rate", 175)),
             volume=float(assistant.get("tts_volume", 0.9)),
             pitch=int(assistant.get("tts_pitch", -12)),
@@ -132,10 +133,10 @@ class AssistantWindow(QWidget):
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("Помощник")
+        title = QLabel("JARVIS // ASSISTANT")
         title.setObjectName("PageTitle")
         subtitle = QLabel(
-            "Jarvis встроен в приложение: чат, голос, разрешения, команды и модели"
+            "Диалог, голосовые команды и Push-to-Talk"
         )
         subtitle.setObjectName("PageSubtitle")
         title_box.addWidget(title)
@@ -146,14 +147,8 @@ class AssistantWindow(QWidget):
         header.addWidget(self.status)
         root.addLayout(header)
 
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self._build_chat())
-        splitter.addWidget(self._build_settings())
-        splitter.setStretchFactor(0, 6)
-        splitter.setStretchFactor(1, 5)
-        splitter.setSizes([650, 550])
-        root.addWidget(splitter, 1)
+        root.addWidget(self._build_chat(), 1)
+        self.advanced_settings_page = self._build_settings()
 
     def _card(self) -> QFrame:
         card = QFrame()
@@ -216,9 +211,18 @@ class AssistantWindow(QWidget):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         body = QWidget()
+        body.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(2, 2, 8, 2)
+        layout.setContentsMargins(28, 24, 28, 28)
         layout.setSpacing(12)
+        title = QLabel("JARVIS CORE // CONFIG")
+        title.setObjectName("PageTitle")
+        subtitle = QLabel(
+            "Голос, нейросети, память, безопасность, сценарии и разрешения"
+        )
+        subtitle.setObjectName("PageSubtitle")
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
         layout.addWidget(self._voice_group())
         layout.addWidget(self._llm_group())
         layout.addWidget(self._safety_group())
@@ -296,6 +300,7 @@ class AssistantWindow(QWidget):
         form.addRow("", self.tts_enabled)
 
         self.tts_engine = QComboBox()
+        self.tts_engine.addItem("Silero v5.5 · лучший русский офлайн", "silero")
         self.tts_engine.addItem("Piper Neural · красивый офлайн-голос", "piper")
         self.tts_engine.addItem("Edge Neural · красивый онлайн-голос", "edge")
         self.tts_engine.addItem("Windows · системный офлайн-голос", "system")
@@ -304,7 +309,7 @@ class AssistantWindow(QWidget):
 
         voice_row = QHBoxLayout()
         self.tts_voice = QComboBox()
-        for voice_id, label in PIPER_VOICES:
+        for voice_id, label in SILERO_VOICES:
             self.tts_voice.addItem(label, voice_id)
         self.test_voice = QPushButton("▶ Проверить")
         self.test_voice.setProperty("secondary", True)
@@ -524,10 +529,10 @@ class AssistantWindow(QWidget):
         self.mic_gain.setValue(float(assistant.get("microphone_gain", 1.0)))
         self.continuous.setChecked(bool(assistant.get("continuous_listening", False)))
         self.tts_enabled.setChecked(bool(assistant.get("tts_enabled", True)))
-        self._set_combo_data(self.tts_engine, assistant.get("tts_engine", "piper"))
+        self._set_combo_data(self.tts_engine, assistant.get("tts_engine", "silero"))
         self._tts_engine_changed()
         self._set_combo_data(
-            self.tts_voice, assistant.get("tts_voice", "ru_RU-denis-medium")
+            self.tts_voice, assistant.get("tts_voice", "eugene")
         )
         self._set_combo_data(
             self.tts_fallback, assistant.get("tts_fallback_engine", "none")
@@ -575,7 +580,9 @@ class AssistantWindow(QWidget):
     def _tts_engine_changed(self, *_args) -> None:
         engine = str(self.tts_engine.currentData())
         selected = self.tts_voice.currentData()
-        if engine == "piper":
+        if engine == "silero":
+            choices = SILERO_VOICES
+        elif engine == "piper":
             choices = PIPER_VOICES
         elif engine == "edge":
             choices = NEURAL_VOICES
@@ -594,6 +601,7 @@ class AssistantWindow(QWidget):
         self.tts_voice.setEnabled(bool(choices))
         self.tts_pitch.setEnabled(engine == "edge")
         tooltips = {
+            "silero": "Silero v5.5: русский, ударения, омографы и вопросы. Полностью локально.",
             "piper": "Настоящий локальный нейронный голос. Интернет после установки не нужен.",
             "edge": "Онлайн Neural. При сбое Windows включится только если это разрешено ниже.",
             "system": "Обычный установленный голос Windows.",

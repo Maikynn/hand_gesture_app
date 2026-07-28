@@ -43,6 +43,14 @@ PIPER_VOICES = [
     ("ru_RU-denis-medium", "Денис · мужской нейронный, офлайн"),
 ]
 DEFAULT_PIPER_VOICE = "ru_RU-denis-medium"
+SILERO_VOICES = [
+    ("eugene", "Eugene · глубокий мужской, JARVIS"),
+    ("aidar", "Aidar · спокойный мужской"),
+    ("xenia", "Xenia · выразительный женский"),
+    ("baya", "Baya · мягкий женский"),
+    ("kseniya", "Kseniya · нейтральный женский"),
+]
+DEFAULT_SILERO_VOICE = "eugene"
 
 
 class SpeechCancelled(Exception):
@@ -75,16 +83,15 @@ def list_voices() -> List[Tuple[str, str]]:
 class TTSEngine:
     """Serializes all speech work on one thread.
 
-    ``piper`` is the default high-quality local neural voice. ``edge`` remains
-    available as an online option, and ``system`` is a separate explicit SAPI
-    option. Fallback is configurable so a selected neural voice is never
-    silently replaced with Microsoft SAPI.
+    ``silero`` is the default high-quality Russian local neural voice. Piper is
+    a lightweight local option, ``edge`` is online, and ``system`` is explicit
+    SAPI. A selected neural voice is never silently replaced with SAPI.
     """
 
     def __init__(
         self,
         *,
-        engine: str = "piper",
+        engine: str = "silero",
         voice_id: Optional[str] = None,
         rate: int = 175,
         volume: float = 0.9,
@@ -93,9 +100,19 @@ class TTSEngine:
         profile: str = "calm",
         on_event: Optional[Callable[[str, str], None]] = None,
     ):
-        self.engine_name = engine if engine in {"piper", "edge", "system"} else "edge"
+        self.engine_name = (
+            engine
+            if engine in {"silero", "piper", "edge", "system"}
+            else "edge"
+        )
         self.voice_id = voice_id or (
-            DEFAULT_PIPER_VOICE if self.engine_name == "piper" else DEFAULT_NEURAL_VOICE
+            DEFAULT_SILERO_VOICE
+            if self.engine_name == "silero"
+            else (
+                DEFAULT_PIPER_VOICE
+                if self.engine_name == "piper"
+                else DEFAULT_NEURAL_VOICE
+            )
         )
         self.rate = max(90, min(260, int(rate)))
         self.volume = max(0.0, min(1.0, float(volume)))
@@ -111,6 +128,7 @@ class TTSEngine:
         self._edge_retry_after = 0.0
         self._piper_voice = None
         self._piper_voice_id = ""
+        self._silero_model = None
         self._on_event = on_event
         self._stopping = threading.Event()
         self.worker_thread = threading.Thread(
@@ -136,6 +154,24 @@ class TTSEngine:
         self.is_speaking = True
         self._notify("synthesizing", "Готовлю голос…")
         try:
+            if request.engine == "silero":
+                try:
+                    self._speak_silero(request)
+                    self._notify("done", "Silero Neural воспроизведён локально")
+                    return
+                except SpeechCancelled:
+                    self._notify("cancelled", "Озвучка остановлена")
+                    return
+                except Exception as exc:
+                    if request.fallback_engine != "system":
+                        raise RuntimeError(
+                            f"Silero Neural недоступен: {exc}. "
+                            "Системный голос не подменял выбранный."
+                        ) from exc
+                    self._notify(
+                        "fallback",
+                        f"Silero недоступен — явно включён резерв Windows: {exc}",
+                    )
             if request.engine == "piper":
                 try:
                     self._speak_piper(request)
@@ -191,6 +227,63 @@ class TTSEngine:
             self._notify("error", f"Ошибка озвучки: {exc}")
         finally:
             self.is_speaking = False
+
+    def _speak_silero(self, request: SpeechRequest) -> None:
+        import torch
+
+        model_path = PROJECT_ROOT / "models" / "silero" / "v5_5_ru.pt"
+        if not model_path.is_file():
+            raise RuntimeError("модель v5_5_ru не установлена; запустите setup_venv.bat")
+        if self._silero_model is None:
+            self._notify("loading", "Загружаю Silero v5.5 · русский Neural…")
+            torch.set_num_threads(max(1, min(4, os.cpu_count() or 2)))
+            self._silero_model = torch.package.PackageImporter(model_path).load_pickle(
+                "tts_models", "model"
+            )
+            self._silero_model.to(torch.device("cpu"))
+        if self._is_cancelled(request.generation):
+            raise SpeechCancelled
+        speaker = (
+            request.voice_id
+            if request.voice_id in {voice_id for voice_id, _ in SILERO_VOICES}
+            else DEFAULT_SILERO_VOICE
+        )
+        audio = self._silero_model.apply_tts(
+            text=request.text,
+            speaker=speaker,
+            sample_rate=48000,
+        )
+        samples = audio.detach().cpu().numpy().astype(np.float32)
+        speed = max(0.86, min(1.16, request.rate / 175.0))
+        if abs(speed - 1.0) > 0.01 and samples.size > 16:
+            source = np.arange(samples.size, dtype=np.float32)
+            target = np.linspace(
+                0,
+                samples.size - 1,
+                max(16, round(samples.size / speed)),
+            )
+            samples = np.interp(target, source, samples).astype(np.float32)
+        samples = np.clip(samples * request.volume, -1.0, 1.0)
+        if self._is_cancelled(request.generation):
+            raise SpeechCancelled
+        self._notify("playing", f"Silero v5.5 · {speaker} · полностью офлайн")
+        self._play_audio(samples, 48000, request.generation)
+
+    def _play_audio(
+        self, audio: np.ndarray, sample_rate: int, generation: int
+    ) -> None:
+        import sounddevice as sd
+
+        sd.play(audio, sample_rate, blocking=False)
+        try:
+            while bool(sd.get_stream().active):
+                if self._is_cancelled(generation):
+                    sd.stop()
+                    raise SpeechCancelled
+                time.sleep(0.04)
+        finally:
+            if self._is_cancelled(generation):
+                sd.stop()
 
     def _speak_piper(self, request: SpeechRequest) -> None:
         if not PIPER_AVAILABLE or PiperVoice is None or SynthesisConfig is None:
@@ -427,8 +520,15 @@ class TTSEngine:
         fallback_engine: Optional[str] = None,
         profile: Optional[str] = None,
     ) -> None:
-        new_engine = engine if engine in {"piper", "edge", "system"} else "edge"
-        default_voice = DEFAULT_PIPER_VOICE if new_engine == "piper" else DEFAULT_NEURAL_VOICE
+        new_engine = (
+            engine
+            if engine in {"silero", "piper", "edge", "system"}
+            else "edge"
+        )
+        default_voice = {
+            "silero": DEFAULT_SILERO_VOICE,
+            "piper": DEFAULT_PIPER_VOICE,
+        }.get(new_engine, DEFAULT_NEURAL_VOICE)
         new_voice = voice_id or default_voice
         with self._state_lock:
             provider_changed = (
@@ -460,7 +560,11 @@ class TTSEngine:
         self.voice_id = voice_id
 
     def set_engine(self, engine: str) -> None:
-        self.engine_name = engine if engine in {"piper", "edge", "system"} else "edge"
+        self.engine_name = (
+            engine
+            if engine in {"silero", "piper", "edge", "system"}
+            else "edge"
+        )
 
     def set_pitch(self, pitch: int) -> None:
         self.pitch = max(-50, min(50, int(pitch)))

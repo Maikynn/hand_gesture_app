@@ -1,12 +1,15 @@
 # Axi Control
 
 A Windows desktop app that combines two-hand gesture control with an embedded
-Jarvis voice assistant. The application has only two main pages:
+Jarvis voice assistant. The interface is split into four focused pages:
 
-- **Camera** — large live preview, separate left/right hand crops, gesture
-  labels, camera/model/brightness controls, and gesture bindings.
-- **Assistant** — chat, wake phrases, microphone and TTS controls, application
-  permissions, editable commands, and LLM provider settings.
+- **Camera** — fixed-size live preview, equal left/right hand cards and only
+  the essential camera, model, brightness, mirror and action controls.
+- **Assistant** — uncluttered text chat and microphone control.
+- **Camera Lab** — model files, visualization, ROI, training, profiles,
+  gesture bindings, sequences and recognition history.
+- **Jarvis Core** — voice, wake phrases, speech recognition, LLM, memory,
+  security, scenarios, permissions, commands and diagnostics.
 
 The assistant runs inside the Python/PyQt process. It does not open a separate
 Jarvis window, Tauri app, Vite server, or background assistant executable.
@@ -28,7 +31,8 @@ The camera page provides:
 - one large camera view;
 - independent previews for the left and right hands;
 - labels such as `Левая: кулак` and `Правая: три`;
-- camera selection, brightness, mirroring, crop padding, and skeleton toggles;
+- camera selection, brightness and mirroring on the live page;
+- crop, skeleton and advanced recognition settings on Camera Lab;
 - rule-based MediaPipe recognition by default;
 - optional built-in or user-selected ONNX/TFLite models;
 - bundled YOLO HaGRID model with a selectable `.pt` path;
@@ -49,7 +53,7 @@ thumb-up/thumb-down. Potentially disruptive bindings start disabled.
 
 ## Embedded Jarvis
 
-The assistant page contains:
+The Assistant and Jarvis Core pages contain:
 
 - text chat and microphone control;
 - multiple wake phrases separated by commas;
@@ -57,7 +61,8 @@ The assistant page contains:
 - editable command phrases with fuzzy matching;
 - a strict allowlist for executable files;
 - original Priler/Jarvis Russian reaction sounds;
-- local Piper Neural Russian speech (`Денис`) that stays offline after setup;
+- local Silero TTS v5.5 Russian speech (`Eugene`) as the default high-quality
+  voice, with Piper (`Денис`) as a lighter offline alternative;
 - optional Edge Neural and explicitly separate Windows SAPI speech;
 - no silent Microsoft SAPI substitution: the fallback is a visible user choice;
 - calm, strict, and emotional voice profiles plus sentence-level streaming TTS;
@@ -67,6 +72,7 @@ The assistant page contains:
 - inspectable/deletable long-term memory and multi-step action scenarios;
 - confirmation levels for important commands and `отмени последнее`;
 - system tray operation and a global `Ctrl+Alt+J` Push-to-Talk hotkey;
+- `Ctrl+1` through `Ctrl+4` navigation and wheel-safe parameter controls;
 - a diagnostics panel for microphone, STT, TTS, LLM and latency;
 - configurable humorous fallback phrases when no model is available.
 
@@ -105,7 +111,9 @@ third_party/priler_jarvis/
 models/vosk-ru/
   offline Russian speech-recognition model
 models/piper/
-  downloaded local neural voice (ignored by Git)
+  downloaded lightweight local neural voice (ignored by Git)
+models/silero/
+  downloaded high-quality Russian Silero voice (ignored by Git)
 models/whisper/
   downloaded Faster-Whisper model (ignored by Git)
 ```

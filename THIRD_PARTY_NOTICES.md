@@ -57,6 +57,14 @@ under GPL-3.0-or-later. `setup_venv.bat` downloads the Russian
 model is installed locally and is intentionally not committed to this
 repository.
 
+## Silero Russian neural speech
+
+The default high-quality Russian voice uses
+[Silero TTS v5.5](https://github.com/snakers4/silero-models) with the
+`v5_5_ru` model. The model supports Russian stress, homographs and question
+intonation and is distributed under CC-NC-BY. It is downloaded by
+`setup_venv.bat` into the Git-ignored `models/silero` directory.
+
 ## Faster-Whisper
 
 Local neural speech recognition uses
