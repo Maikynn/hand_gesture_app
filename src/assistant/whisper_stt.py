@@ -15,7 +15,6 @@ utterance once a silence gap is detected. The recognized text is delivered via
 ``on_final``; ``on_partial`` receives a short "listening" indicator while audio
 is being captured.
 """
-import os
 import struct
 import threading
 from typing import Callable, List, Optional, Tuple
@@ -115,7 +114,7 @@ class WhisperStream:
         self.model = WhisperModel(
             model_path or model_name, device=device, compute_type=compute_type
         )
-        print(f"[WhisperSTT] model loaded")
+        print("[WhisperSTT] model loaded")
 
         self.pa = pyaudio.PyAudio()
         self.stream = None

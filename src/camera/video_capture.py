@@ -6,6 +6,7 @@ Handles webcam acquisition and frame retrieval with error handling.
 
 import cv2
 import numpy as np
+import time
 from typing import Optional, Tuple
 
 class VideoCapture:
@@ -16,6 +17,7 @@ class VideoCapture:
         self.camera_id = camera_id
         self.cap: Optional[cv2.VideoCapture] = None
         self.is_open = False
+        self._last_reconnect = 0.0
         self.open_camera()
         
     def open_camera(self) -> bool:
@@ -46,9 +48,12 @@ class VideoCapture:
         
         ret, frame = self.cap.read()
         if not ret:
-            # Attempt recovery if frame read fails
-            self.cap.release()
-            self.open_camera()
+            # Do not spin on a disconnected camera.
+            now = time.monotonic()
+            if now - self._last_reconnect >= 1.0:
+                self._last_reconnect = now
+                self.cap.release()
+                self.open_camera()
             return False, None
         
         # Convert BGR to RGB for MediaPipe compatibility

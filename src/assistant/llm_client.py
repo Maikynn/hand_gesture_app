@@ -1,150 +1,141 @@
-#!/usr/bin/env python3
-"""
-Unified LLM client.
+from __future__ import annotations
 
-Supports two backends selected by `engine`:
-  * "openrouter" - cloud API at https://openrouter.ai/api/v1
-  * "ollama"     - local model served by Ollama (native /api/chat endpoint)
-
-Both expose a single send_message(user_text) -> str method.
-
-OpenRouter resilience
----------------------
-* 429 (rate limit) and 5xx responses are retried with exponential backoff,
-  honouring the server's `Retry-After` header when present.
-* A fallback chain of models is tried in order, so a single rate-limited or
-  unavailable model automatically rolls over to the next one (e.g. the free
-  tier of one model is exhausted -> try another free model with the same key).
-  This is the main mitigation for the 429 "limit reached" errors.
-"""
-import time
-import requests
 import re
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import requests
+
+
+class LLMError(RuntimeError):
+    pass
+
+
+@dataclass
+class LLMSettings:
+    provider: str = "none"
+    model: str = ""
+    endpoint: str = ""
+    api_key: str = ""
+    system_prompt: str = ""
+    max_tokens: int = 350
+    fallback_models: Optional[List[str]] = None
 
 
 class LLMClient:
-    def __init__(self, engine: str = "openrouter", api_key: str = "",
-                 model: str = "", ollama_url: str = "http://localhost:11434",
-                 ollama_model: str = "llama3", system_prompt: str = "",
-                 max_tokens: int = 200, fallback_models: Optional[List[str]] = None):
-        self.engine = (engine or "openrouter").lower()
-        self.api_key = api_key or ""
-        self.model = model or ""
-        self.ollama_url = ollama_url.rstrip("/") or "http://localhost:11434"
-        self.ollama_model = ollama_model or "llama3"
-        self.system_prompt = system_prompt or ""
-        self.max_tokens = max_tokens
-        # Ordered list of alternative OpenRouter models to try when the
-        # primary is rate-limited / unavailable.
-        self.fallback_models = [m for m in (fallback_models or []) if m]
+    """OpenRouter, Ollama and generic OpenAI-compatible chat client."""
 
-    def send_message(self, message: str, system_prompt: Optional[str] = None) -> Optional[str]:
-        sp = self.system_prompt if system_prompt is None else system_prompt
-        if self.engine == "ollama":
-            return self._ollama(message, sp)
-        return self._openrouter(message, sp)
+    def __init__(self, settings: LLMSettings | None = None):
+        self.settings = settings or LLMSettings()
 
-    # -- OpenRouter (cloud) -------------------------------------------------
-    def _openrouter(self, message: str, sp: str) -> Optional[str]:
-        if not self.api_key:
-            return None
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        messages = []
-        if sp:
-            messages.append({"role": "system", "content": sp})
-        messages.append({"role": "user", "content": message})
+    def configure(self, settings: LLMSettings) -> None:
+        self.settings = settings
 
-        # Primary model first, then the configured fallbacks (deduped).
-        models = [self.model or "openai/gpt-3.5-turbo"]
-        for m in self.fallback_models:
-            if m and m not in models:
-                models.append(m)
+    def is_configured(self) -> bool:
+        provider = self.settings.provider.lower()
+        if provider == "ollama":
+            return bool(self.settings.endpoint and self.settings.model)
+        if provider in {"openrouter", "custom"}:
+            return bool(self.settings.api_key and self.settings.model)
+        return False
 
-        last_err = None
+    def send_message(self, message: str, system_prompt: str | None = None) -> str:
+        provider = self.settings.provider.lower()
+        prompt = self.settings.system_prompt if system_prompt is None else system_prompt
+        if provider == "ollama":
+            return self._ollama(message, prompt)
+        if provider == "openrouter":
+            return self._openrouter(message, prompt)
+        if provider == "custom":
+            return self._openai_compatible(message, prompt)
+        raise LLMError("Провайдер ответов не настроен")
+
+    def _messages(self, message: str, prompt: str) -> List[Dict[str, str]]:
+        result: List[Dict[str, str]] = []
+        if prompt.strip():
+            result.append({"role": "system", "content": prompt.strip()})
+        result.append({"role": "user", "content": message.strip()})
+        return result
+
+    def _openrouter(self, message: str, prompt: str) -> str:
+        if not self.settings.api_key:
+            raise LLMError("Не указан ключ OpenRouter")
+        models = [self.settings.model or "openrouter/auto"]
+        for model in self.settings.fallback_models or []:
+            if model and model not in models:
+                models.append(model)
+        last_error = ""
         for model in models:
-            ok, content, err = self._try_openrouter(headers, messages, model)
-            if ok:
-                return content
-            # A hard (non-retryable) error on one model still lets us try the
-            # next model, because a different model may succeed.
-            last_err = err
-        return last_err or "Ошибка OpenRouter: все модели недоступны."
+            try:
+                return self._post_openai(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    model,
+                    self._messages(message, prompt),
+                    self.settings.api_key,
+                )
+            except LLMError as exc:
+                last_error = str(exc)
+        raise LLMError(last_error or "Все модели OpenRouter недоступны")
 
-    def _try_openrouter(self, headers, messages, model, max_retries: int = 4):
-        """Attempt one model with retry/backoff on 429 and 5xx.
+    def _openai_compatible(self, message: str, prompt: str) -> str:
+        endpoint = self.settings.endpoint.strip().rstrip("/")
+        if not endpoint:
+            raise LLMError("Не указан адрес совместимого API")
+        if not endpoint.endswith("/chat/completions"):
+            endpoint += "/chat/completions"
+        return self._post_openai(
+            endpoint,
+            self.settings.model,
+            self._messages(message, prompt),
+            self.settings.api_key,
+        )
 
-        Returns (success: bool, content: str|None, error: str|None).
-        """
-        payload = {
+    def _post_openai(
+        self, endpoint: str, model: str, messages: List[Dict[str, str]], api_key: str
+    ) -> str:
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": self.max_tokens,
-        }
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        delay = 1.0
-        for attempt in range(max_retries + 1):
-            try:
-                r = requests.post(url, headers=headers, json=payload, timeout=30)
-                if r.status_code == 200:
-                    return True, r.json()["choices"][0]["message"]["content"], None
-                # Retryable: rate limit or server error.
-                if r.status_code == 429 or 500 <= r.status_code < 600:
-                    retry_after = r.headers.get("Retry-After")
-                    try:
-                        wait = float(retry_after) if retry_after is not None else delay
-                    except (TypeError, ValueError):
-                        wait = delay
-                    if attempt < max_retries:
-                        time.sleep(wait)
-                        delay = min(delay * 2, 30.0)
-                        continue
-                    return False, None, (
-                        f"Ошибка OpenRouter ({model}): {r.status_code} "
-                        f"{r.text[:200]}")
-                # Non-retryable client error (401, 403, 404, 422, ...).
-                return False, None, (
-                    f"Ошибка OpenRouter ({model}): {r.status_code} {r.text[:200]}")
-            except Exception as e:
-                if attempt < max_retries:
-                    time.sleep(delay)
-                    delay = min(delay * 2, 30.0)
-                    continue
-                return False, None, f"Ошибка сети OpenRouter: {e}"
-        return False, None, f"Ошибка OpenRouter ({model}): превышено число попыток."
-
-    # -- Ollama (local) -----------------------------------------------------
-    def _ollama(self, message: str, sp: str) -> Optional[str]:
-        url = self.ollama_url + "/api/chat"
-        messages = []
-        if sp:
-            messages.append({"role": "system", "content": sp})
-        messages.append({"role": "user", "content": message})
-        payload = {
-            "model": self.ollama_model,
-            "messages": messages,
-            "stream": False,
-            # Disable chain-of-thought for reasoning models (e.g. deepseek-r1)
-            # so the assistant gets a direct, speakable answer instead of a
-            # <think>...</think> block that would otherwise eat the whole
-            # token budget and leave `content` empty.
-            "think": False,
-            # Reasoning models need headroom; floor the budget so a final
-            # answer is always produced even if `think` is ignored.
-            "options": {"num_predict": max(self.max_tokens, 400)},
+            "temperature": 0.65,
+            "max_tokens": int(self.settings.max_tokens),
         }
         try:
-            r = requests.post(url, json=payload, timeout=120)
-            if r.status_code == 200:
-                content = r.json().get("message", {}).get("content", "") or ""
-                # Defensive: drop any residual reasoning blocks.
-                content = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
-                return content
-            return f"Ошибка Ollama: {r.status_code} {r.text[:200]}"
-        except Exception as e:
-            return (f"Не удалось подключиться к Ollama по адресу "
-                    f"{self.ollama_url}: {e}")
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=45)
+        except requests.RequestException as exc:
+            raise LLMError(f"Нет связи с API: {exc}") from exc
+        if response.status_code != 200:
+            raise LLMError(f"API вернуло HTTP {response.status_code}")
+        try:
+            content = response.json()["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise LLMError("API вернуло неожиданный формат ответа") from exc
+        if not str(content).strip():
+            raise LLMError("API вернуло пустой ответ")
+        return str(content).strip()
+
+    def _ollama(self, message: str, prompt: str) -> str:
+        endpoint = (self.settings.endpoint or "http://127.0.0.1:11434").rstrip("/")
+        payload = {
+            "model": self.settings.model or "llama3.2",
+            "messages": self._messages(message, prompt),
+            "stream": False,
+            "think": False,
+            "options": {"num_predict": max(200, int(self.settings.max_tokens))},
+        }
+        try:
+            response = requests.post(endpoint + "/api/chat", json=payload, timeout=120)
+        except requests.RequestException as exc:
+            raise LLMError(f"Ollama не отвечает: {exc}") from exc
+        if response.status_code != 200:
+            raise LLMError(f"Ollama вернула HTTP {response.status_code}")
+        try:
+            content = str(response.json().get("message", {}).get("content", ""))
+        except ValueError as exc:
+            raise LLMError("Ollama вернула некорректный JSON") from exc
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
+        if not content:
+            raise LLMError("Локальная модель не вернула ответ")
+        return content

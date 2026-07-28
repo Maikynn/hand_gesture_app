@@ -1,372 +1,710 @@
-#!/usr/bin/env python3
-"""
-Main UI window for the Hand Gesture Application.
-Integrates camera feed, skeleton rendering, gesture recognition,
-settings, and assistant functionality.
-"""
+from __future__ import annotations
 
 import sys
-import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
 import cv2
 import numpy as np
-import mediapipe as mp
-from pathlib import Path
-from typing import Dict, Tuple, Optional
-
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QMainWindow, QStackedWidget, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QCheckBox, QSlider, QGroupBox, QSizePolicy, QMessageBox,
-    QRadioButton, QButtonGroup
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSlider,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QImage, QPixmap, QFont
 
-# Import project modules
+from assistant.actions import ACTION_LABELS, ActionExecutor
+from camera.skeleton_renderer import SkeletonRenderer
+from camera.video_capture import VideoCapture
+from hand_processing.gesture_recognizer import GestureRecognizer
+from ui.assistant_window import AssistantWindow
+from ui.theme import apply_theme
+from utils.config_store import ConfigStore
 from utils.logger import setup_logger
 from utils.model_manager import ModelManager
-from camera.video_capture import VideoCapture
-from camera.skeleton_renderer import SkeletonRenderer
-from hand_processing.hand_crop import HandCropProcessor
-from hand_processing.gesture_recognizer import GestureRecognizer
-from hand_processing.gesture_fusion import GestureFusion
-from ui.settings_window import SettingsWindow
-from ui.assistant_window import AssistantWindow
+
+
+GESTURE_LABELS = {
+    "unknown": "неизвестно",
+    "fist": "кулак",
+    "open_palm": "ладонь",
+    "palm": "ладонь",
+    "point": "один",
+    "one": "один",
+    "victory": "два",
+    "two_up": "два",
+    "thumbs_up": "палец вверх",
+    "like": "палец вверх",
+    "thumbs_down": "палец вниз",
+    "dislike": "палец вниз",
+    "ok_sign": "окей",
+    "ok": "окей",
+    "rock": "рок",
+    "peace": "мир",
+    "three": "три",
+    "four": "четыре",
+    "five": "пять",
+    "call_me": "позвони",
+    "call": "позвони",
+    "gun": "пистолет",
+    "pinch": "щипок",
+    "no_gesture": "нет жеста",
+}
+
+CANONICAL_GESTURE = {
+    "open_palm": "palm",
+    "thumbs_up": "like",
+    "thumbs_down": "dislike",
+    "victory": "two_up",
+    "ok_sign": "ok",
+    "point": "one",
+    "call_me": "call",
+}
+
+GESTURES = [
+    "palm",
+    "fist",
+    "like",
+    "dislike",
+    "one",
+    "two_up",
+    "three",
+    "four",
+    "ok",
+    "rock",
+    "call",
+    "gun",
+    "pinch",
+]
+
+
+class HandPreview(QFrame):
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Card")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        self.image = QLabel("Рука не обнаружена")
+        self.image.setObjectName("HandSurface")
+        self.image.setAlignment(Qt.AlignCenter)
+        self.image.setFixedSize(154, 124)
+        self.text = QLabel(f"{title}: —")
+        self.text.setStyleSheet("font-size: 13pt; font-weight: 650;")
+        self.text.setWordWrap(True)
+        layout.addWidget(self.image)
+        layout.addWidget(self.text, 1)
+
+    def clear_hand(self, title: str) -> None:
+        self.image.clear()
+        self.image.setText("Рука не обнаружена")
+        self.text.setText(f"{title}: —")
+
+    def update_hand(self, title: str, gesture: str, confidence: float, crop: np.ndarray) -> None:
+        self.text.setText(
+            f"{title}: {GESTURE_LABELS.get(gesture, gesture)}\n"
+            f"<span style='font-size:9pt;color:#8f9bb3'>{confidence:.0%}</span>"
+        )
+        CameraWidget.set_image(self.image, crop)
+
+
+class GestureBindingsPanel(QFrame):
+    saved = pyqtSignal()
+
+    def __init__(self, store: ConfigStore, executor: ActionExecutor, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.executor = executor
+        self.setObjectName("Card")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        header = QHBoxLayout()
+        title = QLabel("Действия по жестам")
+        title.setStyleSheet("font-size: 14pt; font-weight: 700;")
+        header.addWidget(title)
+        header.addStretch(1)
+        add = QPushButton("+ Привязка")
+        add.setProperty("secondary", True)
+        add.clicked.connect(self.add_row)
+        choose = QPushButton("Выбрать .exe")
+        choose.setProperty("secondary", True)
+        choose.clicked.connect(self.choose_application)
+        remove = QPushButton("Удалить")
+        remove.setProperty("danger", True)
+        remove.clicked.connect(self.remove_selected)
+        save = QPushButton("Сохранить")
+        save.clicked.connect(self.save)
+        for button in (add, choose, remove, save):
+            header.addWidget(button)
+        layout.addLayout(header)
+
+        hint = QLabel(
+            "Жест срабатывает один раз за удержание. Для запуска программы укажи полный путь "
+            "и сначала разреши её во вкладке «Помощник»."
+        )
+        hint.setProperty("muted", True)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["Вкл.", "Жест", "Действие", "Значение", "Точность", "Пауза, мс"]
+        )
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setMinimumHeight(220)
+        layout.addWidget(self.table)
+        for binding in store.get("gesture_bindings", []):
+            self.add_row(binding)
+
+    @staticmethod
+    def _combo(value_map: Dict[str, str], selected: str) -> QComboBox:
+        combo = QComboBox()
+        for value, label in value_map.items():
+            combo.addItem(label, value)
+        index = combo.findData(selected)
+        combo.setCurrentIndex(max(0, index))
+        return combo
+
+    def add_row(self, binding: Optional[Dict[str, Any]] = None) -> None:
+        if isinstance(binding, bool):
+            binding = None
+        binding = binding or {
+            "enabled": True,
+            "gesture": "palm",
+            "type": "system",
+            "target": "play_pause",
+            "confidence": 0.8,
+            "cooldown_ms": 1200,
+        }
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        enabled = QTableWidgetItem()
+        enabled.setFlags(enabled.flags() | Qt.ItemIsUserCheckable)
+        enabled.setCheckState(Qt.Checked if binding.get("enabled", True) else Qt.Unchecked)
+        self.table.setItem(row, 0, enabled)
+        gesture_map = {name: GESTURE_LABELS.get(name, name) for name in GESTURES}
+        self.table.setCellWidget(row, 1, self._combo(gesture_map, str(binding.get("gesture", "palm"))))
+        action_map = {
+            key: label
+            for key, label in ACTION_LABELS.items()
+            if key in {"application", "url", "hotkey", "system"}
+        }
+        self.table.setCellWidget(row, 2, self._combo(action_map, str(binding.get("type", "system"))))
+        self.table.setItem(row, 3, QTableWidgetItem(str(binding.get("target", ""))))
+        self.table.setItem(row, 4, QTableWidgetItem(str(binding.get("confidence", 0.8))))
+        self.table.setItem(row, 5, QTableWidgetItem(str(binding.get("cooldown_ms", 1200))))
+        self.table.selectRow(row)
+
+    def remove_selected(self) -> None:
+        row = self.table.currentRow()
+        if row >= 0:
+            self.table.removeRow(row)
+
+    def choose_application(self) -> None:
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        kind = self.table.cellWidget(row, 2)
+        if not isinstance(kind, QComboBox) or kind.currentData() != "application":
+            QMessageBox.information(self, "Тип действия", "Сначала выбери тип «Приложение».")
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Выберите приложение", "", "Программы (*.exe)")
+        if path:
+            self.table.item(row, 3).setText(path)
+
+    def values(self) -> List[Dict[str, Any]]:
+        result = []
+        for row in range(self.table.rowCount()):
+            gesture = self.table.cellWidget(row, 1)
+            kind = self.table.cellWidget(row, 2)
+            assert isinstance(gesture, QComboBox) and isinstance(kind, QComboBox)
+            result.append(
+                {
+                    "enabled": self.table.item(row, 0).checkState() == Qt.Checked,
+                    "gesture": str(gesture.currentData()),
+                    "type": str(kind.currentData()),
+                    "target": self.table.item(row, 3).text().strip(),
+                    "confidence": float(self.table.item(row, 4).text().replace(",", ".")),
+                    "cooldown_ms": int(self.table.item(row, 5).text()),
+                }
+            )
+        return result
+
+    def save(self) -> None:
+        try:
+            values = self.values()
+            for binding in values:
+                if binding["enabled"]:
+                    self.executor.validate(binding)
+        except Exception as exc:
+            QMessageBox.warning(self, "Привязки не сохранены", str(exc))
+            return
+        self.store.replace_section("gesture_bindings", values)
+        self.saved.emit()
+
 
 class CameraWidget(QWidget):
-    """
-    Widget that displays camera feed with skeleton overlay.
-    Handles hand crop extraction and gesture recognition.
+    status_changed = pyqtSignal(str, str)
 
-    The static gesture model is provided by :class:`GestureFusion`, whose
-    backend (MobileNetV3 / YOLO) can be switched live from the UI without
-    restarting the application.
-    """
-    gesture_detected = pyqtSignal(str, str)  # gesture_name, backend
-
-    def __init__(self, camera_id: int = 0, parent=None):
+    def __init__(self, store: ConfigStore | None = None, parent=None):
         super().__init__(parent)
+        self.store = store or ConfigStore()
         self.logger = setup_logger("CameraWidget")
-        self.camera_id = camera_id
-        self.is_running = False
-        self.parent_settings = None
-
-        # Initialize components
-        self.video_capture = VideoCapture(camera_id)
-        self.skeleton_renderer = SkeletonRenderer()
-        self.hand_crop_processor = HandCropProcessor()
+        self.settings = self.store.get("camera", {}) or {}
+        self.camera_id = int(self.settings.get("device_index", 0))
+        self.video_capture = VideoCapture(self.camera_id)
+        self.renderer = SkeletonRenderer()
         self.model_manager = ModelManager()
-        self.gesture_recognizer = GestureRecognizer(self.model_manager)
-        # Fusion module: switchable MobileNetV3 / YOLO static backends.
-        self.fusion = GestureFusion()
-
-        # UI elements
-        self.video_label = QLabel()
-        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.video_label.setStyleSheet("background-color: black;")
-
-        # Hand crop display
-        self.crop_label = QLabel()
-        self.crop_label.setFixedSize(150, 150)
-        self.crop_label.setStyleSheet("border: 2px solid white;")
-
-        # Gesture display
-        self.gesture_label = QLabel("Gesture: None")
-        self.gesture_label.setFont(QFont("Arial", 14, QFont.Bold))
-        self.gesture_label.setAlignment(Qt.AlignCenter)
-
-        # Layout
-        main_layout = QVBoxLayout()
-        main_layout.addWidget(self.video_label)
-
-        # Hand crop area
-        crop_layout = QHBoxLayout()
-        crop_layout.addWidget(QLabel("Hand Crop:"))
-        crop_layout.addWidget(self.crop_label)
-        main_layout.addLayout(crop_layout)
-
-        # Gesture display
-        main_layout.addWidget(self.gesture_label)
-
-        # Static gesture model backend switch (live, no restart)
-        self.backend_group = QGroupBox("Статическая модель жестов (live)")
-        backend_layout = QVBoxLayout()
-        self.radio_mobilenet = QRadioButton("MobileNetV3 (HaGRID)")
-        self.radio_yolo = QRadioButton("YOLO (HaGRID)")
-        self.radio_mobilenet.setChecked(True)
-        self.backend_button_group = QButtonGroup(self)
-        self.backend_button_group.addButton(self.radio_mobilenet, 0)
-        self.backend_button_group.addButton(self.radio_yolo, 1)
-        self.backend_button_group.buttonClicked.connect(self._on_backend_selected)
-        backend_layout.addWidget(self.radio_mobilenet)
-        backend_layout.addWidget(self.radio_yolo)
-        self.backend_status_label = QLabel("Активна: MobileNetV3 (HaGRID)")
-        self.backend_status_label.setAlignment(Qt.AlignCenter)
-        backend_layout.addWidget(self.backend_status_label)
-        self.refresh_yolo_btn = QPushButton("Обновить YOLO")
-        self.refresh_yolo_btn.clicked.connect(lambda: self._set_static_backend('yolo', force=True))
-        backend_layout.addWidget(self.refresh_yolo_btn)
-        self.backend_group.setLayout(backend_layout)
-        main_layout.addWidget(self.backend_group)
-
-        self.setLayout(main_layout)
-
-        # Timer for video processing
-        self.timer = QTimer()
+        self.recognizer = GestureRecognizer(self.model_manager)
+        self.executor = ActionExecutor(self.store.get("permissions", []))
+        self.bindings = list(self.store.get("gesture_bindings", []))
+        self.timer = QTimer(self)
         self.timer.timeout.connect(self.process_frame)
+        self._last_inference = 0.0
+        self._hand_state: Dict[str, Dict[str, Any]] = {
+            "Left": {"gesture": "", "count": 0, "fired": False},
+            "Right": {"gesture": "", "count": 0, "fired": False},
+        }
+        self._last_action: Dict[Tuple[str, str], float] = {}
+        self._build_ui()
+        self.store.changed.connect(self._store_changed)
 
-    def start(self):
-        """Start video processing."""
-        if not self.is_running:
-            self.is_running = True
-            self.timer.start(30)  # ~33 FPS
-            self.logger.info("Camera widget started")
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(28, 24, 28, 28)
+        layout.setSpacing(14)
 
-    def stop(self):
-        """Stop video processing."""
-        if self.is_running:
-            self.is_running = False
-            self.timer.stop()
-            self.logger.info("Camera widget stopped")
+        header = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title = QLabel("Камера")
+        title.setObjectName("PageTitle")
+        subtitle = QLabel("Большой кадр, две руки и действия без лишних окон")
+        subtitle.setObjectName("PageSubtitle")
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
+        header.addLayout(title_box, 1)
+        self.camera_status = QLabel("Камера подключена" if self.video_capture.is_open else "Нет камеры")
+        self.camera_status.setObjectName(
+            "StatusGood" if self.video_capture.is_open else "StatusBad"
+        )
+        header.addWidget(self.camera_status)
+        layout.addLayout(header)
 
-    def process_frame(self):
-        """Process next video frame."""
-        if not self.is_running:
+        self.video = QLabel("Подключаю камеру…")
+        self.video.setObjectName("VideoSurface")
+        self.video.setAlignment(Qt.AlignCenter)
+        self.video.setMinimumSize(760, 440)
+        self.video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.video, 1)
+
+        hands = QHBoxLayout()
+        hands.setSpacing(14)
+        self.left_hand = HandPreview("Левая")
+        self.right_hand = HandPreview("Правая")
+        hands.addWidget(self.left_hand)
+        hands.addWidget(self.right_hand)
+        layout.addLayout(hands)
+        layout.addWidget(self._controls())
+        self.bindings_panel = GestureBindingsPanel(self.store, self.executor)
+        self.bindings_panel.saved.connect(self._reload_bindings)
+        layout.addWidget(self.bindings_panel)
+        scroll.setWidget(body)
+        root.addWidget(scroll)
+
+    def _controls(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("Card")
+        row = QHBoxLayout(card)
+        row.setContentsMargins(16, 16, 16, 16)
+        row.setSpacing(22)
+        form = QFormLayout()
+        self.camera_combo = QComboBox()
+        for index in range(6):
+            self.camera_combo.addItem(f"Камера {index}", index)
+        self.camera_combo.setCurrentIndex(max(0, self.camera_combo.findData(self.camera_id)))
+        self.camera_combo.currentIndexChanged.connect(self._change_camera)
+        form.addRow("Камера", self.camera_combo)
+
+        self.model_combo = QComboBox()
+        self.model_combo.addItem("Быстрые правила · MediaPipe", "rules")
+        self.model_combo.addItem("Встроенная ONNX/TFLite", "built_in")
+        self.model_combo.addItem("Своя ONNX/TFLite", "custom")
+        index = self.model_combo.findData(str(self.settings.get("model", "rules")))
+        self.model_combo.setCurrentIndex(max(0, index))
+        self.model_combo.currentIndexChanged.connect(self._change_model)
+        form.addRow("Модель", self.model_combo)
+
+        model_path_row = QHBoxLayout()
+        self.model_path = QLineEdit(str(self.settings.get("custom_model_path", "")))
+        choose = QPushButton("…")
+        choose.setFixedWidth(42)
+        choose.setProperty("secondary", True)
+        choose.clicked.connect(self._choose_model)
+        model_path_row.addWidget(self.model_path, 1)
+        model_path_row.addWidget(choose)
+        form.addRow("Файл модели", model_path_row)
+        row.addLayout(form, 2)
+
+        sliders = QFormLayout()
+        self.brightness = QSlider(Qt.Horizontal)
+        self.brightness.setRange(-100, 100)
+        self.brightness.setValue(int(self.settings.get("brightness", 0)))
+        self.brightness.valueChanged.connect(self._save_camera_controls)
+        sliders.addRow("Яркость", self.brightness)
+        self.padding = QSlider(Qt.Horizontal)
+        self.padding.setRange(5, 80)
+        self.padding.setValue(int(self.settings.get("crop_padding", 34)))
+        self.padding.valueChanged.connect(self._save_camera_controls)
+        sliders.addRow("Отступ руки", self.padding)
+        row.addLayout(sliders, 2)
+
+        toggles = QVBoxLayout()
+        self.mirror = QCheckBox("Зеркальное изображение")
+        self.show_hands = QCheckBox("Скелет рук")
+        self.show_face = QCheckBox("Сетка лица")
+        self.show_pose = QCheckBox("Скелет тела")
+        self.mirror.setChecked(bool(self.settings.get("mirror", True)))
+        self.show_hands.setChecked(bool(self.settings.get("show_hands", True)))
+        self.show_face.setChecked(bool(self.settings.get("show_face", False)))
+        self.show_pose.setChecked(bool(self.settings.get("show_pose", False)))
+        for widget in (self.mirror, self.show_hands, self.show_face, self.show_pose):
+            widget.toggled.connect(self._save_camera_controls)
+            toggles.addWidget(widget)
+        row.addLayout(toggles, 1)
+        return card
+
+    def start(self) -> None:
+        if not self.timer.isActive():
+            self.timer.start(30)
+
+    def stop(self) -> None:
+        self.timer.stop()
+
+    def _change_camera(self, *_args) -> None:
+        new_id = int(self.camera_combo.currentData())
+        if new_id == self.camera_id:
             return
-
-        success, frame = self.video_capture.read_frame()
-        if not success:
-            return
-
-        # Keep original frame for drawing
-        display_frame = frame.copy()
-
-        # Get settings (with safe defaults)
-        show_face = False
-        show_hand = False
-        show_pose = False
-        if self.parent_settings is not None:
-            show_face = getattr(self.parent_settings, 'show_face_skeleton', False)
-            show_hand = getattr(self.parent_settings, 'show_hand_skeleton', False)
-            show_pose = getattr(self.parent_settings, 'show_body_skeleton', False)
-
-        # Process with skeleton renderer (now returns 3 values)
-        processed_frame, landmarks, _ = self.skeleton_renderer.process_frame(
-            frame, show_face, show_hand, show_pose
+        self.video_capture.release()
+        self.camera_id = new_id
+        self.video_capture = VideoCapture(new_id)
+        self.store.set("camera.device_index", new_id)
+        self._set_camera_status(
+            "good" if self.video_capture.is_open else "bad",
+            f"Камера {new_id} подключена" if self.video_capture.is_open else "Камера недоступна",
         )
 
-        # Extract hand crop if hand detected
-        if landmarks['hands']:
+    def _choose_model(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите модель жестов", "", "Модели (*.onnx *.tflite)"
+        )
+        if path:
+            self.model_path.setText(path)
+            self.model_combo.setCurrentIndex(self.model_combo.findData("custom"))
+            self._change_model()
+
+    def _change_model(self, *_args) -> None:
+        model = str(self.model_combo.currentData())
+        self.store.update_many(
+            {
+                "camera.model": model,
+                "camera.custom_model_path": self.model_path.text().strip(),
+            }
+        )
+        if model == "rules":
+            self.recognizer.has_model = False
+            self._set_camera_status("good", "Модель: быстрые правила")
+            return
+        if model == "built_in":
+            self.recognizer.model = self.model_manager.get_current_model()
+            self.recognizer.has_model = self.recognizer.model is not None
+        else:
+            loaded = self.model_manager.load_external_model(self.model_path.text().strip())
+            self.recognizer.model = self.model_manager.get_current_model()
+            self.recognizer.has_model = loaded
+        if self.recognizer.has_model:
+            self._set_camera_status("good", "Нейросетевая модель загружена")
+        else:
+            self.model_combo.setCurrentIndex(self.model_combo.findData("rules"))
+            self._set_camera_status("warn", "Модель недоступна — включены быстрые правила")
+
+    def _save_camera_controls(self, *_args) -> None:
+        self.store.update_many(
+            {
+                "camera.brightness": self.brightness.value(),
+                "camera.crop_padding": self.padding.value(),
+                "camera.mirror": self.mirror.isChecked(),
+                "camera.show_hands": self.show_hands.isChecked(),
+                "camera.show_face": self.show_face.isChecked(),
+                "camera.show_pose": self.show_pose.isChecked(),
+            }
+        )
+
+    def _store_changed(self, key: str, _value: Any) -> None:
+        if key == "permissions":
+            self.executor.set_permissions(self.store.get("permissions", []))
+        elif key == "gesture_bindings":
+            self._reload_bindings()
+
+    def _reload_bindings(self) -> None:
+        self.bindings = list(self.store.get("gesture_bindings", []))
+        self.executor.set_permissions(self.store.get("permissions", []))
+        self._set_camera_status("good", "Привязки жестов применены")
+
+    def process_frame(self) -> None:
+        ok, frame = self.video_capture.read_frame()
+        if not ok or frame is None:
+            self.video.setText("Нет сигнала с камеры")
+            return
+        if self.mirror.isChecked():
+            frame = cv2.flip(frame, 1)
+        beta = self.brightness.value()
+        if beta:
+            frame = cv2.convertScaleAbs(frame, alpha=1.0, beta=beta)
+
+        now = time.monotonic()
+        interval = int(self.store.get("camera.inference_interval_ms", 100)) / 1000.0
+        if now - self._last_inference >= interval:
+            self._last_inference = now
+            frame, landmarks, _ = self.renderer.process_frame(
+                frame,
+                self.show_face.isChecked(),
+                self.show_hands.isChecked(),
+                self.show_pose.isChecked(),
+            )
+            self._update_hands(frame, landmarks)
+        self.set_image(self.video, frame)
+
+    def _update_hands(self, frame: np.ndarray, landmarks: Dict[str, Any]) -> None:
+        seen = set()
+        raw_hands = landmarks.get("raw_hands", [])
+        handedness = landmarks.get("handedness", [])
+        pixel_hands = landmarks.get("hands", [])
+        for index, raw_hand in enumerate(raw_hands[:2]):
+            side = str(handedness[index] if index < len(handedness) else "Unknown")
+            if side not in {"Left", "Right"}:
+                side = "Left" if "Left" not in seen else "Right"
+            seen.add(side)
+            coords = pixel_hands[index] if index < len(pixel_hands) else []
+            crop = self._crop(frame, coords, self.padding.value())
+            if crop is None:
+                continue
+            gesture, _palm_side = self.recognizer.recognize_gesture(crop, raw_hand)
+            gesture = CANONICAL_GESTURE.get(gesture, gesture)
+            confidence = 0.9 if gesture not in {"unknown", "no_gesture"} else 0.4
+            preview = self.left_hand if side == "Left" else self.right_hand
+            preview.update_hand("Левая" if side == "Left" else "Правая", gesture, confidence, crop)
+            self._stabilize_and_fire(side, gesture, confidence)
+        if "Left" not in seen:
+            self.left_hand.clear_hand("Левая")
+            self._stabilize_and_fire("Left", "no_gesture", 0.0)
+        if "Right" not in seen:
+            self.right_hand.clear_hand("Правая")
+            self._stabilize_and_fire("Right", "no_gesture", 0.0)
+
+    @staticmethod
+    def _crop(frame: np.ndarray, points: List[Tuple[int, int]], padding: int) -> Optional[np.ndarray]:
+        if not points:
+            return None
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        height, width = frame.shape[:2]
+        x1, x2 = max(0, min(xs) - padding), min(width, max(xs) + padding)
+        y1, y2 = max(0, min(ys) - padding), min(height, max(ys) + padding)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        return cv2.resize(crop, (210, 160), interpolation=cv2.INTER_AREA)
+
+    def _stabilize_and_fire(self, side: str, gesture: str, confidence: float) -> None:
+        state = self._hand_state[side]
+        if gesture in {"unknown", "no_gesture"}:
+            state["count"] = max(0, int(state["count"]) - 1)
+            if state["count"] == 0:
+                state["gesture"] = ""
+                state["fired"] = False
+            return
+        if state["gesture"] == gesture:
+            state["count"] += 1
+        else:
+            state.update({"gesture": gesture, "count": 1, "fired": False})
+        stable_frames = int(self.store.get("camera.stable_frames", 3))
+        if state["count"] < stable_frames or state["fired"]:
+            return
+        for binding in self.bindings:
+            if not binding.get("enabled", True) or binding.get("gesture") != gesture:
+                continue
+            if confidence < float(binding.get("confidence", 0.8)):
+                continue
+            key = (side, gesture)
+            now = time.monotonic()
+            cooldown = int(binding.get("cooldown_ms", 1200)) / 1000.0
+            if now - self._last_action.get(key, 0.0) < cooldown:
+                continue
             try:
-                hand_crop = self.hand_crop_processor.extract_hand_crop(
-                    processed_frame, landmarks
-                )
-                if hand_crop is not None:
-                    # Update crop label
-                    h, w, ch = hand_crop.shape
-                    bytes_per_line = ch * w
-                    qt_image = QImage(hand_crop.data, w, h, bytes_per_line, QImage.Format_RGB888)
-                    pixmap = QPixmap.fromImage(qt_image)
-                    self.crop_label.setPixmap(pixmap.scaled(150, 150, Qt.KeepAspectRatio))
+                message = self.executor.execute(binding)
+                self._last_action[key] = now
+                state["fired"] = True
+                self._set_camera_status("good", f"{side}: {message}")
+            except Exception as exc:
+                state["fired"] = True
+                self._set_camera_status("bad", str(exc))
+            break
 
-                    # Run gesture recognition via the fusion module
-                    # (switchable MobileNetV3 / YOLO static backends + MediaPipe)
-                    raw_hand = landmarks['raw_hands'][0] if landmarks['raw_hands'] else None
-                    if raw_hand is not None:
-                        lm_list = raw_hand.landmark
-                        fh, fw, _ = frame.shape
-                        # GestureFusion expects a BGR frame (it converts internally).
-                        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                        gesture_name, conf, _ = self.fusion.predict(
-                            frame_bgr, lm_list, fw, fh, None
-                        )
-                        backend = self.fusion._static_backend
-                        self.gesture_detected.emit(gesture_name, backend)
-                        self.gesture_label.setText(
-                            f"Gesture: {gesture_name} ({conf:.2f}) [{backend}]"
-                        )
-                    else:
-                        self.gesture_label.setText("Gesture: None")
-            except Exception as e:
-                self.logger.error(f"Error in hand crop processing: {e}")
-        else:
-            # Clear crop label
-            self.crop_label.clear()
-            self.gesture_label.setText("Gesture: None")
+    def _set_camera_status(self, level: str, text: str) -> None:
+        names = {"good": "StatusGood", "warn": "StatusWarn", "bad": "StatusBad"}
+        self.camera_status.setObjectName(names.get(level, "StatusWarn"))
+        self.camera_status.setText(text)
+        self.camera_status.style().unpolish(self.camera_status)
+        self.camera_status.style().polish(self.camera_status)
+        self.status_changed.emit(level, text)
 
-        # Convert frame to QImage for display (RGB -> BGR for Qt)
-        bgr_frame = cv2.cvtColor(processed_frame, cv2.COLOR_RGB2BGR)
-        h, w, ch = bgr_frame.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(bgr_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qt_image)
+    @staticmethod
+    def set_image(label: QLabel, rgb: np.ndarray) -> None:
+        height, width, channels = rgb.shape
+        image = QImage(
+            rgb.data, width, height, channels * width, QImage.Format_RGB888
+        ).copy()
+        label.setPixmap(
+            QPixmap.fromImage(image).scaled(
+                label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+        )
 
-        # Scale to fit label while maintaining aspect ratio
-        # Use label size if valid, otherwise use frame dimensions
-        label_size = self.video_label.size()
-        if label_size.width() > 0 and label_size.height() > 0:
-            target_size = label_size
-        else:
-            target_size = pixmap.size()
-        self.video_label.setPixmap(pixmap.scaled(
-            target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
-        ))
-
-    # ----------------------- static backend switching -----------------------
-    def _on_backend_selected(self, button):
-        if button is self.radio_yolo:
-            self._set_static_backend('yolo')
-        else:
-            self._set_static_backend('mobilenet')
-
-    def _set_static_backend(self, name: str, force: bool = False):
-        """Switch the static gesture model backend live (no restart)."""
-        try:
-            if name == 'yolo':
-                self.fusion.use_yolo_static()
-            else:
-                self.fusion.use_mobilenet_static()
-        except Exception as e:
-            self.logger.error(f"backend switch error: {e}")
-        self._update_backend_status()
-
-    def _update_backend_status(self):
-        backend = self.fusion._static_backend
-        if backend == 'yolo':
-            yolo = self.fusion._yolo
-            if yolo is not None and getattr(yolo, 'loaded', False):
-                self.backend_status_label.setText("Активна: YOLO (HaGRID)")
-            else:
-                self.backend_status_label.setText(
-                    "YOLO: модель не обучена — fallback на MobileNetV3"
-                )
-        else:
-            self.backend_status_label.setText("Активна: MobileNetV3 (HaGRID)")
-
-    def set_parent_settings(self, settings_obj):
-        """Set reference to settings object for accessing user preferences."""
-        self.parent_settings = settings_obj
-
-    def cleanup(self):
-        """Release resources."""
+    def cleanup(self) -> None:
         self.stop()
         self.video_capture.release()
-        self.skeleton_renderer.release()
+        self.renderer.release()
 
 
 class MainWindow(QMainWindow):
-    """
-    Main application window with three main sections:
-    1. Settings
-    2. Camera (with skeleton rendering)
-    3. Assistant
-    """
     def __init__(self):
         super().__init__()
         self.logger = setup_logger("MainWindow")
+        self.store = ConfigStore()
+        self.setWindowTitle("Axi Control · Жесты и Jarvis")
+        self.resize(1440, 920)
+        self.setMinimumSize(1080, 720)
 
-        # Initialize model manager
-        self.model_manager = ModelManager()
-
-        # Create UI components
-        self.settings_window = SettingsWindow()
-        self.camera_widget = CameraWidget(camera_id=0)
-        self.assistant_window = AssistantWindow()
-
-        # Set up main stack widget
+        self.camera_page = CameraWidget(self.store)
+        self.assistant_page = AssistantWindow(self.store)
         self.stack = QStackedWidget()
-        self.stack.addWidget(self.settings_window)
-        self.stack.addWidget(self.camera_widget)
-        self.stack.addWidget(self.assistant_window)
-        self.setCentralWidget(self.stack)
+        self.stack.addWidget(self.camera_page)
+        self.stack.addWidget(self.assistant_page)
+        self._build_shell()
+        self.camera_page.status_changed.connect(self._status)
+        self.assistant_page.status_changed.connect(self._status)
+        self.camera_page.start()
+        app = QApplication.instance()
+        if app:
+            apply_theme(app, str(self.store.get("ui.theme", "dark")))
+        self.assistant_page.set_theme(str(self.store.get("ui.theme", "dark")))
 
-        # Set window properties
-        self.setWindowTitle("Hand Gesture Application")
-        self.resize(1200, 800)
+    def _build_shell(self) -> None:
+        central = QWidget()
+        layout = QHBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        sidebar = QWidget()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(230)
+        side = QVBoxLayout(sidebar)
+        side.setContentsMargins(18, 22, 18, 20)
+        side.setSpacing(9)
+        brand = QLabel("AXI CONTROL")
+        brand.setObjectName("Brand")
+        caption = QLabel("Жесты + Jarvis")
+        caption.setObjectName("BrandCaption")
+        side.addWidget(brand)
+        side.addWidget(caption)
+        side.addSpacing(20)
+        self.camera_button = QPushButton("Камера\nжесты и действия")
+        self.assistant_button = QPushButton("Помощник\nчат и настройки")
+        for button in (self.camera_button, self.assistant_button):
+            button.setCheckable(True)
+            button.setMinimumHeight(60)
+            button.setProperty("secondary", True)
+            side.addWidget(button)
+        self.camera_button.setChecked(True)
+        self.camera_button.clicked.connect(lambda: self._show_page(0))
+        self.assistant_button.clicked.connect(lambda: self._show_page(1))
+        side.addStretch(1)
+        self.theme_button = QPushButton("☀ Светлая тема")
+        self.theme_button.setProperty("secondary", True)
+        self.theme_button.clicked.connect(self._toggle_theme)
+        side.addWidget(self.theme_button)
+        self.global_status = QLabel("Готово")
+        self.global_status.setObjectName("StatusGood")
+        self.global_status.setWordWrap(True)
+        side.addWidget(self.global_status)
+        layout.addWidget(sidebar)
+        layout.addWidget(self.stack, 1)
+        self.setCentralWidget(central)
+        self._sync_theme_button()
 
-        # Setup navigation buttons
-        self.setup_navigation()
+    def _show_page(self, index: int) -> None:
+        self.stack.setCurrentIndex(index)
+        self.camera_button.setChecked(index == 0)
+        self.assistant_button.setChecked(index == 1)
 
-        # Connect signals
-        self.settings_window.apply_settings.connect(self.apply_user_settings)
-        self.camera_widget.gesture_detected.connect(self.handle_gesture)
+    def _toggle_theme(self) -> None:
+        current = str(self.store.get("ui.theme", "dark"))
+        theme = "light" if current == "dark" else "dark"
+        self.store.set("ui.theme", theme)
+        app = QApplication.instance()
+        if app:
+            apply_theme(app, theme)
+        self.assistant_page.set_theme(theme)
+        self._sync_theme_button()
 
-        # Load default settings
-        self.apply_user_settings(self.settings_window.settings)
+    def _sync_theme_button(self) -> None:
+        dark = str(self.store.get("ui.theme", "dark")) == "dark"
+        self.theme_button.setText("☀ Светлая тема" if dark else "☾ Тёмная тема")
 
-        # Setup camera
-        self.camera_widget.set_parent_settings(self.settings_window)
+    def _status(self, level: str, text: str) -> None:
+        names = {"good": "StatusGood", "warn": "StatusWarn", "bad": "StatusBad"}
+        self.global_status.setObjectName(names.get(level, "StatusWarn"))
+        self.global_status.setText(text)
+        self.global_status.style().unpolish(self.global_status)
+        self.global_status.style().polish(self.global_status)
 
-        # Load model (non-fatal if missing)
-        try:
-            if self.model_manager.get_current_model() is None:
-                self.logger.warning("No gesture model loaded - using rule-based recognition")
-        except Exception as e:
-            self.logger.error(f"Model loading issue: {e}")
-
-        # Start camera
-        self.camera_widget.start()
-
-    def setup_navigation(self):
-        """Create navigation controls for switching between sections."""
-        nav_widget = QWidget()
-        nav_layout = QHBoxLayout()
-
-        self.settings_btn = QPushButton("Settings")
-        self.camera_btn = QPushButton("Camera")
-        self.assistant_btn = QPushButton("Assistant")
-
-        self.settings_btn.clicked.connect(lambda: self.stack.setCurrentWidget(self.settings_window))
-        self.camera_btn.clicked.connect(lambda: self.stack.setCurrentWidget(self.camera_widget))
-        self.assistant_btn.clicked.connect(lambda: self.stack.setCurrentWidget(self.assistant_window))
-
-        nav_layout.addWidget(self.settings_btn)
-        nav_layout.addWidget(self.camera_btn)
-        nav_layout.addWidget(self.assistant_btn)
-        nav_widget.setLayout(nav_layout)
-
-        self.setMenuWidget(nav_widget)
-
-    def apply_user_settings(self, settings: dict):
-        """Apply user settings to appropriate components."""
-        # Update camera widget settings reference
-        if hasattr(self.camera_widget, 'set_parent_settings'):
-            self.camera_widget.set_parent_settings(self.settings_window)
-
-        # Update assistant settings if needed
-        if hasattr(self.assistant_window, 'apply_settings'):
-            try:
-                self.assistant_window.apply_settings(settings)
-            except Exception as e:
-                self.logger.error(f"Error applying assistant settings: {e}")
-
-        self.logger.info(f"Applied settings: {list(settings.keys())}")
-
-    def handle_gesture(self, gesture_name: str, palm_side: str):
-        """Handle recognized gesture."""
-        self.logger.info(f"Detected gesture: {gesture_name} ({palm_side})")
-        # Could trigger specific actions based on gesture
-
-    def closeEvent(self, event):
-        """Handle window close event."""
-        self.logger.info("Main window closing")
-        # Cleanup camera resources
-        if hasattr(self, 'camera_widget'):
-            self.camera_widget.cleanup()
-        # Cleanup assistant resources
-        if hasattr(self, 'assistant_window'):
-            self.assistant_window.cleanup()
+    def closeEvent(self, event) -> None:
+        self.camera_page.cleanup()
+        self.assistant_page.cleanup()
         event.accept()
 
-def main():
-    """Application entry point."""
-    from PyQt5.QtWidgets import QApplication
+
+def main() -> None:
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-
     window = MainWindow()
     window.show()
-
     sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
     main()

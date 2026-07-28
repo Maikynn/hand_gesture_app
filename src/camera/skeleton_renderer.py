@@ -7,7 +7,7 @@ Draws facial landmarks, hand skeleton, and body joints on video frames.
 import cv2
 import numpy as np
 import mediapipe as mp
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, Tuple, Optional, Any
 
 class SkeletonRenderer:
     """

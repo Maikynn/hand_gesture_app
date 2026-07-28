@@ -1,0 +1,11 @@
+target-version = "py312"
+exclude = [
+    ".git",
+    "venv",
+    "models",
+    "third_party",
+]
+
+[lint]
+# Keep CI focused on syntax errors, undefined names, and broken imports.
+select = ["E9", "F"]

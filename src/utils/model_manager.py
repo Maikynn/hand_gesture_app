@@ -4,8 +4,6 @@ Model management utilities for the Hand Gesture Application.
 Supports loading TFLite and ONNX models for gesture recognition.
 """
 
-import os
-import json
 import numpy as np
 from pathlib import Path
 from typing import Optional, List, Any
@@ -82,12 +80,13 @@ class ModelManager:
         custom_model = self.model_dir / "custom" / model_path
         if not custom_model.exists():
             return False
-        
         try:
             if custom_model.suffix == ".tflite":
                 if not TFLITE_AVAILABLE:
                     return False
-                self.loaded_models[model_path] = tf.lite.Interpreter(model_path=str(custom_model))
+                self.loaded_models[model_path] = tf.lite.Interpreter(
+                    model_path=str(custom_model)
+                )
                 self.loaded_models[model_path].allocate_tensors()
                 self.model_type = "tflite"
             elif custom_model.suffix == ".onnx":
@@ -97,12 +96,39 @@ class ModelManager:
                 self.model_type = "onnx"
             else:
                 return False
-            
             self.current_model = model_path
             self._load_gesture_names()
             return True
-        except Exception as e:
-            print(f"Error loading custom model: {e}")
+        except Exception as exc:
+            print(f"Error loading custom model: {exc}")
+            return False
+
+    def load_external_model(self, model_path: str) -> bool:
+        """Load an absolute .onnx/.tflite path selected in the camera UI."""
+        path = Path(model_path).expanduser()
+        if not path.is_absolute() or not path.is_file():
+            return False
+        try:
+            if path.suffix.lower() == ".tflite":
+                if not TFLITE_AVAILABLE:
+                    return False
+                model = tf.lite.Interpreter(model_path=str(path))
+                model.allocate_tensors()
+                self.model_type = "tflite"
+            elif path.suffix.lower() == ".onnx":
+                if not ONNX_AVAILABLE:
+                    return False
+                model = ort.InferenceSession(str(path))
+                self.model_type = "onnx"
+            else:
+                return False
+            key = f"external:{path}"
+            self.loaded_models[key] = model
+            self.current_model = key
+            self._load_gesture_names()
+            return True
+        except Exception as exc:
+            print(f"Error loading external model: {exc}")
             return False
     
     def get_current_model(self) -> Optional[Any]:

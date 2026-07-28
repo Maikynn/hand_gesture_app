@@ -1,224 +1,261 @@
-#!/usr/bin/env python3
-"""
-Wake-word detection and speech recognition for the Hand Gesture Application.
-Uses Vosk (offline) or Whisper (bond005/whisper-podlodka-turbo) for speech
-recognition and wake-word detection.
-"""
+from __future__ import annotations
 
-import os
 import json
-import queue
 import threading
 import time
-from typing import Optional, Callable
+from pathlib import Path
+from typing import Callable, Dict, List, Optional
 
-# Try to import Vosk, fall back to speech_recognition if not available
+import numpy as np
+
+from utils.config_store import PROJECT_ROOT
+
 try:
-    from vosk import Model, KaldiRecognizer
+    from vosk import KaldiRecognizer, Model
+
     VOSK_AVAILABLE = True
 except ImportError:
+    KaldiRecognizer = Model = None  # type: ignore[assignment]
     VOSK_AVAILABLE = False
+
+try:
     import speech_recognition as sr
 
+    SR_AVAILABLE = True
+except ImportError:
+    sr = None  # type: ignore[assignment]
+    SR_AVAILABLE = False
+
+
 class WakeWordListener:
-    """
-    Listens for wake word and transcribes speech.
-    """
-    def __init__(self, wake_word: str = "аксиос", model_path: str = "models/vosk-model-ru",
-                 stt_engine: str = "vosk", whisper_model: str = "bond005/whisper-podlodka-turbo",
-                 mic_index: Optional[int] = None, gain: float = 1.0):
-        self.wake_word = wake_word.lower()
-        self.model_path = model_path
-        self.stt_engine = stt_engine.lower()
+    """Single-threaded microphone listener with an armed wake-word state."""
+
+    def __init__(
+        self,
+        wake_word: str = "джарвис, аксиос",
+        model_path: str = "models/vosk-ru",
+        stt_engine: str = "vosk",
+        whisper_model: str = "",
+        mic_index: Optional[int] = None,
+        gain: float = 1.0,
+    ):
+        self.wake_word = wake_word
+        self.wake_phrases = self._split_wake_phrases(wake_word)
+        path = Path(model_path)
+        self.model_path = path if path.is_absolute() else PROJECT_ROOT / path
+        self.stt_engine = (stt_engine or "vosk").lower()
         self.whisper_model = whisper_model
         self.mic_index = mic_index
-        self.gain = max(1.0, float(gain))
+        self.gain = max(0.5, min(10.0, float(gain)))
         self.is_listening = False
-        self.callback = None
-        self.thread = None
-        self.continuous_mode = False  # If True, process all speech; if False, only after wake word
-        self._whisper_stream = None
+        self.continuous_mode = False
+        self.callback: Optional[Callable[[str], None]] = None
+        self.status_callback: Optional[Callable[[str, str], None]] = None
+        self.thread: Optional[threading.Thread] = None
+        self._model = None
+        self._armed_until = 0.0
+        self._lock = threading.Lock()
 
-        if self.stt_engine == "whisper":
-            # Whisper stream is created lazily in _listen_whisper.
-            pass
-        elif VOSK_AVAILABLE:
-            self.setup_vosk()
-        else:
-            self.setup_speech_recognition()
+    @staticmethod
+    def _split_wake_phrases(value: str) -> List[str]:
+        value = value.replace("|", ",").replace(";", ",")
+        return [part.strip().lower() for part in value.split(",") if part.strip()]
 
-    def setup_vosk(self):
-        """Setup Vosk model for offline recognition."""
-        if not os.path.exists(self.model_path):
-            print(f"Vosk model not found at {self.model_path}")
-            print("Please download from https://alphacephei.com/vosk/models")
-            self.vosk_model = None
-        else:
-            self.vosk_model = Model(self.model_path)
-
-    def setup_speech_recognition(self):
-        """Setup speech_recognition as fallback."""
-        self.recognizer = sr.Recognizer()
-        self.microphone = sr.Microphone()
-
-    def start_listening(self, callback: Callable[[str], None], continuous: bool = False):
-        """
-        Start listening for wake word and speech.
-
-        Args:
-            callback: Function to call with transcribed text (command after wake word)
-            continuous: If True, process all speech; if False, only after wake word
-        """
-        self.is_listening = True
-        self.callback = callback
-        self.continuous_mode = continuous
-
-        if self.stt_engine == "whisper":
-            self.thread = threading.Thread(target=self._listen_whisper)
-        elif VOSK_AVAILABLE and self.vosk_model:
-            self.thread = threading.Thread(target=self._listen_vosk)
-        else:
-            self.thread = threading.Thread(target=self._listen_sr)
-
-        self.thread.daemon = True
-        self.thread.start()
-
-    def stop_listening(self):
-        """Stop listening."""
-        self.is_listening = False
-        if self._whisper_stream is not None:
-            try:
-                self._whisper_stream.stop()
-            except Exception:
-                pass
-            self._whisper_stream = None
-        if self.thread:
-            self.thread.join(timeout=1.0)
-
-    def _listen_vosk(self):
-        """Listen using Vosk."""
-        import pyaudio
-
-        p = pyaudio.PyAudio()
-        stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000,
-                       input=True, frames_per_buffer=8000)
-        stream.start_stream()
-
-        rec = KaldiRecognizer(self.vosk_model, 16000)
-
-        while self.is_listening:
-            data = stream.read(4000, exception_on_overflow=False)
-            if rec.AcceptWaveform(data):
-                result = json.loads(rec.Result())
-                text = result.get("text", "").lower()
-                if text:
-                    self._process_text(text)
-
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
-
-    def _listen_whisper(self):
-        """Listen using the Whisper STT engine (bond005/whisper-podlodka-turbo)."""
-        from assistant.whisper_stt import WhisperStream, whisper_available
-        if not whisper_available():
-            print("[WakeWordListener] Whisper unavailable, falling back to Vosk")
-            if VOSK_AVAILABLE and self.vosk_model:
-                self._listen_vosk()
-            else:
-                self._listen_sr()
-            return
-
-        def on_final(text: str):
-            lowered = text.lower().strip()
-            if lowered:
-                self._process_text(lowered)
-
+    @staticmethod
+    def list_input_devices() -> List[Dict[str, object]]:
+        devices: List[Dict[str, object]] = []
         try:
-            self._whisper_stream = WhisperStream(
-                model_name=self.whisper_model,
-                mic_index=self.mic_index,
-                gain=self.gain,
-                on_partial=None,
-                on_final=on_final,
+            import pyaudio
+
+            audio = pyaudio.PyAudio()
+            try:
+                for index in range(audio.get_device_count()):
+                    info = audio.get_device_info_by_index(index)
+                    if int(info.get("maxInputChannels", 0)) > 0:
+                        devices.append(
+                            {"index": index, "name": str(info.get("name", f"Микрофон {index}"))}
+                        )
+            finally:
+                audio.terminate()
+        except Exception:
+            pass
+        return devices
+
+    def configure(
+        self,
+        *,
+        wake_word: str,
+        model_path: str,
+        stt_engine: str,
+        mic_index: Optional[int],
+        gain: float,
+    ) -> None:
+        was_listening = self.is_listening
+        callback = self.callback
+        status_callback = self.status_callback
+        continuous = self.continuous_mode
+        if was_listening:
+            self.stop_listening()
+        self.wake_word = wake_word
+        self.wake_phrases = self._split_wake_phrases(wake_word)
+        path = Path(model_path)
+        self.model_path = path if path.is_absolute() else PROJECT_ROOT / path
+        self.stt_engine = (stt_engine or "vosk").lower()
+        self.mic_index = mic_index
+        self.gain = max(0.5, min(10.0, float(gain)))
+        self._model = None
+        if was_listening and callback:
+            self.start_listening(callback, continuous, status_callback)
+
+    def start_listening(
+        self,
+        callback: Callable[[str], None],
+        continuous: bool = False,
+        status_callback: Optional[Callable[[str, str], None]] = None,
+    ) -> bool:
+        with self._lock:
+            if self.thread and self.thread.is_alive():
+                return False
+            self.is_listening = True
+            self.callback = callback
+            self.continuous_mode = continuous
+            self.status_callback = status_callback
+            target = self._listen_vosk if self.stt_engine == "vosk" else self._listen_sr
+            self.thread = threading.Thread(target=target, name="jarvis-listener", daemon=True)
+            self.thread.start()
+        self._status("listening", "Микрофон включён")
+        return True
+
+    def stop_listening(self) -> None:
+        self.is_listening = False
+        thread = self.thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
+        self.thread = None
+        self._status("idle", "Микрофон выключен")
+
+    def _status(self, state: str, message: str) -> None:
+        if self.status_callback:
+            self.status_callback(state, message)
+
+    def _load_vosk(self):
+        if not VOSK_AVAILABLE or Model is None:
+            raise RuntimeError("Пакет vosk не установлен")
+        required = (
+            self.model_path / "am" / "final.mdl",
+            self.model_path / "conf" / "model.conf",
+            self.model_path / "graph" / "HCLr.fst",
+            self.model_path / "graph" / "Gr.fst",
+        )
+        missing = [path.name for path in required if not path.is_file()]
+        if missing:
+            raise RuntimeError(
+                f"Модель Vosk неполная ({', '.join(missing)}): {self.model_path}"
             )
-            self._whisper_stream.start()
+        if self._model is None:
+            self._status("loading", "Загружаю офлайн-модель Vosk…")
+            self._model = Model(str(self.model_path))
+        return self._model
+
+    def _listen_vosk(self) -> None:
+        audio = None
+        stream = None
+        try:
+            import pyaudio
+
+            model = self._load_vosk()
+            audio = pyaudio.PyAudio()
+            kwargs = {
+                "format": pyaudio.paInt16,
+                "channels": 1,
+                "rate": 16000,
+                "input": True,
+                "frames_per_buffer": 4000,
+            }
+            if self.mic_index is not None and int(self.mic_index) >= 0:
+                kwargs["input_device_index"] = int(self.mic_index)
+            stream = audio.open(**kwargs)
+            recognizer = KaldiRecognizer(model, 16000)
+            self._status("ready", "Vosk слушает локально")
             while self.is_listening:
-                time.sleep(0.2)
-        except Exception as e:
-            print(f"[WakeWordListener] Whisper error: {e}")
+                data = stream.read(4000, exception_on_overflow=False)
+                if self.gain != 1.0:
+                    samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                    samples = np.clip(samples * self.gain, -32768, 32767).astype(np.int16)
+                    data = samples.tobytes()
+                if recognizer.AcceptWaveform(data):
+                    text = str(json.loads(recognizer.Result()).get("text", "")).strip()
+                    if text:
+                        self.process_recognized_text(text)
+        except Exception as exc:
+            self._status("error", str(exc))
         finally:
-            if self._whisper_stream is not None:
+            if stream is not None:
                 try:
-                    self._whisper_stream.stop()
+                    stream.stop_stream()
+                    stream.close()
                 except Exception:
                     pass
-                self._whisper_stream = None
+            if audio is not None:
+                audio.terminate()
+            self.is_listening = False
 
-    def _listen_sr(self):
-        """Listen using speech_recognition."""
-        with self.microphone as source:
-            self.recognizer.adjust_for_ambient_noise(source)
+    def _listen_sr(self) -> None:
+        if not SR_AVAILABLE or sr is None:
+            self._status("error", "SpeechRecognition не установлен")
+            self.is_listening = False
+            return
+        try:
+            recognizer = sr.Recognizer()
+            microphone = sr.Microphone(device_index=self.mic_index)
+            with microphone as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.6)
+            self._status("ready", "Онлайн-распознавание слушает")
+            while self.is_listening:
+                try:
+                    with microphone as source:
+                        audio = recognizer.listen(source, timeout=1, phrase_time_limit=8)
+                    text = recognizer.recognize_google(audio, language="ru-RU")
+                    if text:
+                        self.process_recognized_text(text)
+                except sr.WaitTimeoutError:
+                    continue
+                except sr.UnknownValueError:
+                    continue
+                except Exception as exc:
+                    self._status("error", str(exc))
+                    time.sleep(0.5)
+        except Exception as exc:
+            self._status("error", str(exc))
+        finally:
+            self.is_listening = False
 
-        while self.is_listening:
-            try:
-                with self.microphone as source:
-                    audio = self.recognizer.listen(source, timeout=1.0)
-                text = self.recognizer.recognize_google(audio, language="ru-RU").lower()
-                if text:
-                    self._process_text(text)
-            except Exception:
-                continue
-
-    def _process_text(self, text: str):
-        """
-        Process transcribed text for wake word.
-
-        Args:
-            text: Lowercased transcribed text
-        """
-        if self.wake_word in text:
-            # Extract command after wake word
-            idx = text.find(self.wake_word)
-            command = text[idx + len(self.wake_word):].strip()
-            # Only call callback if there's a command or in continuous mode
-            if command:
-                if self.callback:
+    def process_recognized_text(self, text: str) -> Optional[str]:
+        """Route one finalized transcript. Kept public for deterministic tests."""
+        normalized = " ".join(text.lower().strip().split())
+        if not normalized:
+            return None
+        now = time.monotonic()
+        if self.continuous_mode:
+            if self.callback:
+                self.callback(normalized)
+            return normalized
+        for phrase in self.wake_phrases:
+            position = normalized.find(phrase)
+            if position >= 0:
+                command = normalized[position + len(phrase) :].strip(" ,.!?-")
+                self._armed_until = now + 8.0
+                self._status("wake", f"Услышал «{phrase}»")
+                if command and self.callback:
+                    self._armed_until = 0.0
                     self.callback(command)
-            else:
-                # Wake word detected but no command - in continuous mode, ignore
-                # Otherwise, we could prompt for command, but for now just ignore
-                pass
-        elif self.continuous_mode and self.callback:
-            # Continuous mode: process all speech
-            self.callback(text)
+                return command
+        if now <= self._armed_until:
+            self._armed_until = 0.0
+            if self.callback:
+                self.callback(normalized)
+            return normalized
+        return None
 
     def test_microphone(self) -> bool:
-        """Test if microphone is available."""
-        try:
-            if VOSK_AVAILABLE:
-                import pyaudio
-                p = pyaudio.PyAudio()
-                p.terminate()
-                return True
-            else:
-                with self.microphone as source:
-                    return True
-        except Exception:
-            return False
-
-
-if __name__ == "__main__":
-    # Example usage
-    listener = WakeWordListener()
-
-    def on_speech(text):
-        print(f"Heard: {text}")
-
-    listener.start_listening(on_speech)
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        listener.stop_listening()
+        return bool(self.list_input_devices())

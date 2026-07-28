@@ -1,61 +1,260 @@
 {
+  "ui": {
+    "theme": "dark",
+    "language": "ru"
+  },
   "camera": {
-    "device_index": 1,
-    "width": 1280,
-    "height": 720,
-    "fps": 30,
-    "show_face": true,
+    "device_index": 0,
+    "brightness": 0,
+    "mirror": true,
     "show_hands": true,
-    "show_eyes": true,
-    "show_brows": true,
-    "show_lips": true,
-    "show_fingers": true,
-    "show_palm": true,
-    "brightness": 4,
-    "contrast": 1.0,
-    "flip": true
+    "show_face": false,
+    "show_pose": false,
+    "crop_padding": 34,
+    "model": "rules",
+    "custom_model_path": "",
+    "inference_interval_ms": 100,
+    "stable_frames": 3,
+    "release_frames": 3
   },
-  "gesture": {
-    "model_path": "",
-    "confidence_threshold": 0.85,
-    "hand_crop_size": 150,
-    "hand_crop_padding": 30,
-    "palm_side_detection": true,
-    "static_model_id": "yolo_v8"
-  },
-  "voice": {
-    "enabled": true,
-    "wake_word": "аксиос",
-    "wake_threshold": 0.75,
-    "samples_dir": "C:\\Users\\Nikolay\\Desktop\\hand_gesture_app\\wake_samples",
-    "stt_engine": "whisper",
-    "whisper_model": "bond005/whisper-podlodka-turbo",
-    "stt_cloud_url": "",
-    "stt_cloud_key": "",
-    "tts_engine": "silero",
-    "tts_speaker": "xenia",
-    "xtts_voice": "",
-    "llm_engine": "openrouter",
-    "openrouter_key": "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",
-    "openrouter_model": "qwen/qwen3-coder:free",
-    "ollama_url": "http://localhost:11434",
-    "ollama_model": "tom_himanen/deepseek-r1-roo-cline-tools:8b",
-    "system_prompt": "Ты — голосовой помощник Акси. Отвечай кратко и по делу на русском.",
-    "max_tokens": 200,
-    "volume_step": 10,
-    "mic_index": 1,
-    "vosk_model_path": "C:\\Users\\Nikolay\\Desktop\\hand_gesture_app\\models\\vosk-ru",
-    "tts_voice": "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens\\TTS_MS_EN-US_ZIRA_11.0",
-    "tts_rate": 196,
-    "mic_gain": 10.0,
+  "assistant": {
+    "wake_phrases": "джарвис, аксиос",
+    "stt_engine": "vosk",
+    "vosk_model_path": "models/vosk-ru",
+    "microphone_index": -1,
+    "microphone_gain": 1.0,
+    "continuous_listening": false,
+    "tts_enabled": true,
+    "tts_rate": 175,
+    "tts_volume": 0.9,
+    "llm_provider": "none",
+    "openrouter_model": "openrouter/auto",
     "openrouter_fallback_models": [
-      "qwen/qwen3-coder:"
+      "google/gemini-2.0-flash-exp:free",
+      "qwen/qwen3-8b:free"
+    ],
+    "ollama_url": "http://127.0.0.1:11434",
+    "ollama_model": "llama3.2",
+    "custom_api_url": "",
+    "custom_model": "",
+    "system_prompt": "Ты — встроенный голосовой помощник Jarvis. Отвечай кратко, дружелюбно и по-русски. Не утверждай, что выполнил действие, если оно не было выполнено приложением.",
+    "max_tokens": 350,
+    "command_match_threshold": 66,
+    "error_phrases": [
+      "Похоже, мои нейроны ушли на перекур. Настрой модель — и попробуем снова.",
+      "Я бы с радостью ответил, но цифровые тараканы перегрызли провод к модели.",
+      "Команду не узнал, а мозги ещё не подключены. Зато прозвучало уверенно!",
+      "Сегодня я больше JAR, чем VIS. Проверь настройки провайдера."
     ]
   },
-  "models": {
-    "static_model_path": "F:\\MODELS\\Model_lerning\\hagrid_mixed_geometry_tune\\weights best\\pt",
-    "dynamic_model_path": "F:\\MODELS\\Model_lerning\\dynamic_model.pth",
-    "device": "cpu",
-    "dynamic_threshold": 0.6
-  }
+  "permissions": [
+    {
+      "name": "Блокнот",
+      "path": "C:\\Windows\\System32\\notepad.exe",
+      "enabled": true
+    },
+    {
+      "name": "Калькулятор",
+      "path": "C:\\Windows\\System32\\calc.exe",
+      "enabled": true
+    },
+    {
+      "name": "Проводник",
+      "path": "C:\\Windows\\explorer.exe",
+      "enabled": true
+    },
+    {
+      "name": "Диспетчер задач",
+      "path": "C:\\Windows\\System32\\Taskmgr.exe",
+      "enabled": true
+    }
+  ],
+  "commands": [
+    {
+      "id": "open_notepad",
+      "phrases": [
+        "открой блокнот",
+        "запусти блокнот",
+        "мне нужен блокнот"
+      ],
+      "type": "application",
+      "target": "C:\\Windows\\System32\\notepad.exe",
+      "reply": "Открываю блокнот",
+      "enabled": true
+    },
+    {
+      "id": "open_calculator",
+      "phrases": [
+        "открой калькулятор",
+        "запусти калькулятор",
+        "калькулятор"
+      ],
+      "type": "application",
+      "target": "C:\\Windows\\System32\\calc.exe",
+      "reply": "Считаем",
+      "enabled": true
+    },
+    {
+      "id": "open_explorer",
+      "phrases": [
+        "открой проводник",
+        "запусти проводник",
+        "покажи файлы"
+      ],
+      "type": "application",
+      "target": "C:\\Windows\\explorer.exe",
+      "reply": "Открываю проводник",
+      "enabled": true
+    },
+    {
+      "id": "open_task_manager",
+      "phrases": [
+        "открой диспетчер задач",
+        "запусти диспетчер задач",
+        "диспетчер задач"
+      ],
+      "type": "application",
+      "target": "C:\\Windows\\System32\\Taskmgr.exe",
+      "reply": "Открываю диспетчер задач",
+      "enabled": true
+    },
+    {
+      "id": "open_google",
+      "phrases": [
+        "открой гугл",
+        "открой поиск",
+        "запусти гугл"
+      ],
+      "type": "url",
+      "target": "https://www.google.com",
+      "reply": "Открываю поиск",
+      "enabled": true
+    },
+    {
+      "id": "volume_up",
+      "phrases": [
+        "сделай громче",
+        "прибавь громкость",
+        "увеличь звук"
+      ],
+      "type": "system",
+      "target": "volume_up",
+      "reply": "Делаю громче",
+      "enabled": true
+    },
+    {
+      "id": "volume_down",
+      "phrases": [
+        "сделай тише",
+        "убавь громкость",
+        "уменьши звук"
+      ],
+      "type": "system",
+      "target": "volume_down",
+      "reply": "Делаю тише",
+      "enabled": true
+    },
+    {
+      "id": "volume_mute",
+      "phrases": [
+        "выключи звук",
+        "включи беззвучный режим",
+        "переключи звук"
+      ],
+      "type": "system",
+      "target": "volume_mute",
+      "reply": "Переключаю звук",
+      "enabled": true
+    },
+    {
+      "id": "screenshot",
+      "phrases": [
+        "сделай скриншот",
+        "сними экран",
+        "сделай снимок экрана"
+      ],
+      "type": "system",
+      "target": "screenshot",
+      "reply": "Открываю инструмент снимка экрана",
+      "enabled": true
+    },
+    {
+      "id": "show_desktop",
+      "phrases": [
+        "покажи рабочий стол",
+        "сверни все окна",
+        "убери окна"
+      ],
+      "type": "system",
+      "target": "show_desktop",
+      "reply": "Показываю рабочий стол",
+      "enabled": true
+    },
+    {
+      "id": "thanks",
+      "phrases": [
+        "спасибо",
+        "молодец",
+        "отличная работа"
+      ],
+      "type": "response",
+      "target": "Всегда пожалуйста. Я для этого и собран.",
+      "reply": "Всегда пожалуйста. Я для этого и собран.",
+      "enabled": true
+    },
+    {
+      "id": "joke",
+      "phrases": [
+        "расскажи шутку",
+        "пошути",
+        "рассмеши меня"
+      ],
+      "type": "response",
+      "target": "Почему программист перепутал Хэллоуин и Рождество? Потому что OCT 31 равняется DEC 25.",
+      "reply": "Почему программист перепутал Хэллоуин и Рождество? Потому что OCT 31 равняется DEC 25.",
+      "enabled": true
+    }
+  ],
+  "gesture_bindings": [
+    {
+      "gesture": "palm",
+      "type": "system",
+      "target": "play_pause",
+      "enabled": true,
+      "confidence": 0.78,
+      "cooldown_ms": 1300
+    },
+    {
+      "gesture": "like",
+      "type": "system",
+      "target": "volume_up",
+      "enabled": true,
+      "confidence": 0.8,
+      "cooldown_ms": 650
+    },
+    {
+      "gesture": "dislike",
+      "type": "system",
+      "target": "volume_down",
+      "enabled": true,
+      "confidence": 0.8,
+      "cooldown_ms": 650
+    },
+    {
+      "gesture": "fist",
+      "type": "system",
+      "target": "volume_mute",
+      "enabled": false,
+      "confidence": 0.82,
+      "cooldown_ms": 1400
+    },
+    {
+      "gesture": "two_up",
+      "type": "system",
+      "target": "screenshot",
+      "enabled": false,
+      "confidence": 0.82,
+      "cooldown_ms": 1800
+    }
+  ]
 }
