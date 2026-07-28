@@ -1,6 +1,5 @@
-opencv-python==4.9.0.80
 opencv-contrib-python==4.9.0.80
-mediapipe==0.10.14
+mediapipe==0.10.21
 numpy==1.26.4
 protobuf>=4.25.3,<5
 jax==0.4.35
@@ -9,6 +8,7 @@ scipy==1.14.1
 PyQt5==5.15.11
 requests>=2.32,<3
 pyttsx3>=2.90,<3
+edge-tts==7.2.8
 SpeechRecognition>=3.10,<4
 vosk>=0.3.45,<0.4
 PyAudio>=0.2.14,<0.3; platform_system == "Windows"

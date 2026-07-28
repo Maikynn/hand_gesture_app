@@ -1,153 +1,261 @@
 #!/usr/bin/env python3
-"""
-TTS Engine for the Axi assistant.
+"""Queued Jarvis-style neural TTS with a reliable offline fallback."""
 
-Offline text-to-speech via pyttsx3 (SAPI5 on Windows).
+from __future__ import annotations
 
-A SINGLE pyttsx3 engine is created (lazily, on the worker thread) and reused
-for every utterance. This avoids two well-known SAPI5/pyttsx3 pitfalls:
-
-  * Creating a fresh engine per utterance eventually raises
-    "run loop already started". Each pyttsx3.init() advises its own SAPI5
-    event sink on the thread; the COM message loop is left in a "running"
-    state, so the next engine's runAndWait() collides with it. Reusing one
-    engine per thread eliminates the collision.
-
-  * The legacy "speaks only once" bug is not present in current pyttsx3, so a
-    persistent engine driven with say()+runAndWait() per utterance is reliable.
-
-All engine access happens on the worker thread (the engine is created and
-driven there), so there are no cross-thread COM calls.
-"""
-import pyttsx3
-import threading
+import ctypes
+import os
 import queue
+import tempfile
+import threading
 import time
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Any, List, Optional, Tuple
+
+import pyttsx3
+
+
+NEURAL_VOICES = [
+    ("ru-RU-DmitryNeural", "Дмитрий · мужской, глубокий"),
+    ("ru-RU-SvetlanaNeural", "Светлана · женский, мягкий"),
+]
+DEFAULT_NEURAL_VOICE = "ru-RU-DmitryNeural"
 
 
 def list_voices() -> List[Tuple[str, str]]:
-    """Return [(voice_id, name), ...] for every installed TTS voice."""
+    """Return installed Windows SAPI voices without failing application startup."""
     try:
-        eng = pyttsx3.init()
-        voices = eng.getProperty("voices") or []
-        return [(v.id, v.name) for v in voices]
+        engine = pyttsx3.init()
+        voices = engine.getProperty("voices") or []
+        return [(voice.id, voice.name) for voice in voices]
     except Exception:
         return []
 
 
 class TTSEngine:
-    def __init__(self, use_offline: bool = True, voice_id: Optional[str] = None,
-                 rate: int = 160, volume: float = 0.9):
-        self.use_offline = use_offline
-        self.speech_queue: "queue.Queue" = queue.Queue()
+    """Serializes all speech work on one thread.
+
+    ``edge`` uses a high-quality Microsoft neural voice over the network.
+    When the service is unavailable, the same utterance automatically falls
+    back to the local Windows SAPI voice.
+    """
+
+    def __init__(
+        self,
+        *,
+        engine: str = "edge",
+        voice_id: Optional[str] = DEFAULT_NEURAL_VOICE,
+        rate: int = 175,
+        volume: float = 0.9,
+        pitch: int = -12,
+    ):
+        self.engine_name = engine if engine in {"edge", "system"} else "edge"
+        self.voice_id = voice_id or DEFAULT_NEURAL_VOICE
+        self.rate = max(90, min(260, int(rate)))
+        self.volume = max(0.0, min(1.0, float(volume)))
+        self.pitch = max(-50, min(50, int(pitch)))
         self.is_speaking = False
-        self.volume = max(0.0, min(1.0, volume))
-        self.rate = max(50, min(400, rate))
-        self.voice_id = voice_id
-        # One persistent engine, created lazily on the worker thread.
-        self._engine = None
-        self._engine_lock = threading.Lock()
-        self.worker_thread = threading.Thread(target=self._process_queue, daemon=True)
+
+        self.speech_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+        self._offline_engine: Any = None
+        self._engine_lock = threading.RLock()
+        self._state_lock = threading.Lock()
+        self._mci_alias = ""
+        self._edge_retry_after = 0.0
+        self._stopping = threading.Event()
+        self.worker_thread = threading.Thread(
+            target=self._process_queue,
+            name="jarvis-tts",
+            daemon=True,
+        )
         self.worker_thread.start()
 
-    def _ensure_engine(self):
-        """Create the (single, persistent) pyttsx3 engine on this thread if
-        needed, and apply the current voice/rate/volume settings."""
-        if self._engine is None:
-            eng = pyttsx3.init()
-            self._apply_settings(eng)
-            self._engine = eng
-        return self._engine
-
-    def _process_queue(self):
-        while True:
+    def _process_queue(self) -> None:
+        while not self._stopping.is_set():
+            item = self.speech_queue.get()
             try:
-                item = self.speech_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if item is None:
-                break
-            self._speak(item)
-            self.speech_queue.task_done()
+                if item is None:
+                    return
+                self._speak(item)
+            finally:
+                self.speech_queue.task_done()
 
-    def _apply_settings(self, eng):
-        try:
-            eng.setProperty("rate", self.rate)
-            eng.setProperty("volume", self.volume)
-            vid = self.voice_id
-            voices = eng.getProperty("voices") or []
-            if not vid:
-                for v in voices:
-                    if "russian" in v.name.lower() or "ru" in v.id.lower():
-                        vid = v.id
-                        break
-                if not vid and voices:
-                    vid = voices[0].id
-            if vid:
-                eng.setProperty("voice", vid)
-                self.voice_id = vid
-        except Exception as e:
-            print("TTS settings error:", e)
-
-    def _speak(self, text: str):
-        if not text or not text.strip():
+    def _speak(self, text: str) -> None:
+        if not text.strip():
             return
         self.is_speaking = True
         try:
-            with self._engine_lock:
-                eng = self._ensure_engine()
-                # Apply live settings right before speaking (worker thread
-                # only -> no cross-thread COM calls).
-                self._apply_settings(eng)
-                eng.say(text)
-                eng.runAndWait()
-        except Exception as e:
-            print("Speech error:", e)
-            # The engine's COM loop may be in a bad state; drop it so the next
-            # utterance rebuilds a fresh one (single recovery, not a loop).
-            try:
-                with self._engine_lock:
-                    self._engine = None
-            except Exception:
-                pass
+            if self.engine_name == "edge":
+                if time.monotonic() >= self._edge_retry_after:
+                    try:
+                        self._speak_edge(text)
+                        self._edge_retry_after = 0.0
+                        return
+                    except Exception as exc:
+                        # Do not make every reply wait on the same unavailable
+                        # online service. Retry after five minutes or settings save.
+                        self._edge_retry_after = time.monotonic() + 300.0
+                        print(f"Neural TTS unavailable, using Windows voice: {exc}")
+            self._speak_offline(text)
+        except Exception as exc:
+            print(f"Speech error: {exc}")
+            self._offline_engine = None
         finally:
             self.is_speaking = False
 
-    def speak(self, text: str):
-        if text and text.strip():
-            self.speech_queue.put(text.strip())
+    def _speak_edge(self, text: str) -> None:
+        import edge_tts
 
-    def set_volume(self, volume: float):
-        self.volume = max(0.0, min(1.0, volume))
+        rate_percent = round((self.rate - 175) / 1.75)
+        volume_percent = round((self.volume - 1.0) * 100)
+        communicator = edge_tts.Communicate(
+            text,
+            self.voice_id or DEFAULT_NEURAL_VOICE,
+            rate=f"{rate_percent:+d}%",
+            volume=f"{volume_percent:+d}%",
+            pitch=f"{self.pitch:+d}Hz",
+            connect_timeout=5,
+            receive_timeout=30,
+        )
+        handle, raw_path = tempfile.mkstemp(prefix="axi-jarvis-", suffix=".mp3")
+        os.close(handle)
+        path = Path(raw_path)
+        try:
+            communicator.save_sync(str(path))
+            if not path.is_file() or path.stat().st_size < 256:
+                raise RuntimeError("Сервис не вернул аудио")
+            self._play_mp3(path)
+        finally:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
-    def set_rate(self, rate: int):
-        self.rate = max(50, min(400, rate))
+    def _play_mp3(self, path: Path) -> None:
+        if os.name != "nt":
+            raise RuntimeError("Neural playback is currently configured for Windows")
+        alias = f"axi_jarvis_{threading.get_ident()}"
+        with self._state_lock:
+            self._mci_alias = alias
+        try:
+            self._mci(f'open "{path}" type mpegvideo alias {alias}')
+            self._mci(f"play {alias} wait")
+        finally:
+            try:
+                self._mci(f"close {alias}", check=False)
+            finally:
+                with self._state_lock:
+                    self._mci_alias = ""
 
-    def set_voice(self, voice_id: str):
+    @staticmethod
+    def _mci(command: str, *, check: bool = True) -> None:
+        winmm = ctypes.windll.winmm
+        code = int(winmm.mciSendStringW(command, None, 0, None))
+        if code and check:
+            buffer = ctypes.create_unicode_buffer(256)
+            winmm.mciGetErrorStringW(code, buffer, len(buffer))
+            raise RuntimeError(buffer.value or f"MCI error {code}")
+
+    def _ensure_offline_engine(self):
+        if self._offline_engine is None:
+            self._offline_engine = pyttsx3.init()
+        self._apply_offline_settings()
+        return self._offline_engine
+
+    def _apply_offline_settings(self) -> None:
+        if self._offline_engine is None:
+            return
+        engine = self._offline_engine
+        engine.setProperty("rate", self.rate)
+        engine.setProperty("volume", self.volume)
+        voices = engine.getProperty("voices") or []
+        selected = None
+        if self.engine_name == "system" and self.voice_id:
+            selected = next((voice.id for voice in voices if voice.id == self.voice_id), None)
+        if not selected:
+            selected = next(
+                (
+                    voice.id
+                    for voice in voices
+                    if "russian" in voice.name.lower()
+                    or "ru-ru" in voice.id.lower()
+                    or "irina" in voice.name.lower()
+                ),
+                voices[0].id if voices else None,
+            )
+        if selected:
+            engine.setProperty("voice", selected)
+
+    def _speak_offline(self, text: str) -> None:
+        with self._engine_lock:
+            engine = self._ensure_offline_engine()
+            engine.say(text)
+            engine.runAndWait()
+
+    def speak(self, text: str) -> None:
+        value = str(text).strip()
+        if value:
+            self.speech_queue.put(value)
+
+    def configure(
+        self,
+        *,
+        engine: str,
+        voice_id: str,
+        rate: int,
+        volume: float,
+        pitch: int,
+    ) -> None:
+        self.engine_name = engine if engine in {"edge", "system"} else "edge"
+        self.voice_id = voice_id or DEFAULT_NEURAL_VOICE
+        self.rate = max(90, min(260, int(rate)))
+        self.volume = max(0.0, min(1.0, float(volume)))
+        self.pitch = max(-50, min(50, int(pitch)))
+        self._edge_retry_after = 0.0
+
+    def set_volume(self, volume: float) -> None:
+        self.volume = max(0.0, min(1.0, float(volume)))
+
+    def set_rate(self, rate: int) -> None:
+        self.rate = max(90, min(260, int(rate)))
+
+    def set_voice(self, voice_id: str) -> None:
         self.voice_id = voice_id
 
-    def get_voices(self):
-        try:
-            return pyttsx3.init().getProperty("voices")
-        except Exception:
-            return []
+    def set_engine(self, engine: str) -> None:
+        self.engine_name = engine if engine in {"edge", "system"} else "edge"
 
-    def stop(self):
-        while not self.speech_queue.empty():
+    def set_pitch(self, pitch: int) -> None:
+        self.pitch = max(-50, min(50, int(pitch)))
+
+    def get_voices(self) -> List[Tuple[str, str]]:
+        return list_voices()
+
+    def stop(self) -> None:
+        while True:
             try:
-                self.speech_queue.get_nowait()
+                item = self.speech_queue.get_nowait()
             except queue.Empty:
                 break
+            else:
+                self.speech_queue.task_done()
+                if item is None:
+                    self.speech_queue.put(None)
+                    break
+        with self._state_lock:
+            alias = self._mci_alias
+        if alias and os.name == "nt":
+            self._mci(f"stop {alias}", check=False)
+        with self._engine_lock:
+            if self._offline_engine is not None:
+                try:
+                    self._offline_engine.stop()
+                except Exception:
+                    pass
         self.is_speaking = False
 
-    def shutdown(self):
+    def shutdown(self) -> None:
+        self._stopping.set()
+        self.stop()
         self.speech_queue.put(None)
-        self.worker_thread.join(timeout=2.0)
-
-
-if __name__ == "__main__":
-    tts = TTSEngine()
-    tts.speak("Привет! Я Акси, ваш голосовой помощник.")
-    time.sleep(2)
-    tts.shutdown()
+        self.worker_thread.join(timeout=2.5)

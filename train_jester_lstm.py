@@ -22,7 +22,6 @@ Outputs (to --out, default F:\\MODELS\\jester_lstm):
 """
 
 import os
-import sys
 import json
 import argparse
 

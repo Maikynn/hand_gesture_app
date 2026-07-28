@@ -2,9 +2,8 @@
 REM ===========================================================================
 REM  Axi Gesture Assistant - FULL application (hand_gesture_app)
 REM  Runs inside the Python 3.12 virtual environment, which is REQUIRED because
-REM  MediaPipe 0.10.35 on Python 3.14 has no working vision API (neither
-REM  mp.solutions nor mediapipe.tasks.vision). The venv uses mediapipe 0.10.14
-REM  which still ships the legacy mp.solutions API.
+REM  Python 3.12 and MediaPipe 0.10.21 are pinned for the stable Windows
+REM  mp.solutions API used by the real-time hand tracker.
 REM ===========================================================================
 cd /d "%~dp0"
 if not exist "venv\Scripts\activate.bat" (

@@ -15,7 +15,8 @@
     "custom_model_path": "",
     "inference_interval_ms": 100,
     "stable_frames": 3,
-    "release_frames": 3
+    "release_frames": 3,
+    "actions_enabled": false
   },
   "assistant": {
     "wake_phrases": "джарвис, аксиос",
@@ -25,7 +26,10 @@
     "microphone_gain": 1.0,
     "continuous_listening": false,
     "tts_enabled": true,
+    "tts_engine": "edge",
+    "tts_voice": "ru-RU-DmitryNeural",
     "tts_rate": 175,
+    "tts_pitch": -12,
     "tts_volume": 0.9,
     "llm_provider": "none",
     "openrouter_model": "openrouter/auto",

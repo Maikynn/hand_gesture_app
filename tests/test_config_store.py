@@ -38,6 +38,24 @@ class ConfigStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get("permissions")[0]["name"], "Test")
         self.assertEqual(self.store.get("ui.theme"), "dark")
 
+    def test_ui_choices_are_local_and_versioned_defaults_stay_unchanged(self):
+        original_public = self.public.read_text(encoding="utf-8")
+        self.store.update_many(
+            {
+                "camera.device_index": 2,
+                "assistant.tts_voice": "ru-RU-DmitryNeural",
+            }
+        )
+        self.store.replace_section(
+            "permissions", [{"name": "Local", "path": "C:/local.exe", "enabled": True}]
+        )
+
+        self.assertEqual(self.public.read_text(encoding="utf-8"), original_public)
+        local = json.loads(self.local.read_text(encoding="utf-8"))
+        self.assertEqual(local["camera"]["device_index"], 2)
+        self.assertEqual(local["assistant"]["tts_voice"], "ru-RU-DmitryNeural")
+        self.assertEqual(local["permissions"][0]["name"], "Local")
+
 
 if __name__ == "__main__":
     unittest.main()

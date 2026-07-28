@@ -13,7 +13,8 @@ Jarvis window, Tauri app, Vite server, or background assistant executable.
 
 ## Quick start
 
-Python 3.12 is required because the project pins MediaPipe 0.10.14.
+Python 3.12 is required because the project pins the Windows-compatible
+MediaPipe 0.10.21 build.
 
 ```bat
 setup_venv.bat
@@ -31,6 +32,7 @@ The camera page provides:
 - rule-based MediaPipe recognition by default;
 - optional built-in or user-selected ONNX/TFLite models;
 - stable-frame filtering and one action per held gesture;
+- safe mode: gesture actions stay off until explicitly enabled;
 - application, URL, hotkey, and safe built-in system actions.
 
 Default bindings include play/pause on an open palm and volume control on
@@ -46,16 +48,19 @@ The assistant page contains:
 - editable command phrases with fuzzy matching;
 - a strict allowlist for executable files;
 - original Priler/Jarvis Russian reaction sounds;
+- a deep Microsoft neural Russian voice with speed, pitch, and volume controls;
+- automatic offline Windows voice fallback when the network is unavailable;
 - OpenRouter, local Ollama, or any OpenAI-compatible API;
 - configurable humorous fallback phrases when no model is available.
 
-API keys are never written to tracked `config.json`. They are stored only in
-the git-ignored `config.local.json`.
+API keys and every choice made in the interface are never written to tracked
+`config.json`. They are stored only in the git-ignored `config.local.json`.
 
 ## Configuration
 
-- `config.json` — shareable settings, permissions, commands, and bindings.
-- `config.local.json` — local API keys; created automatically and ignored.
+- `config.json` — versioned defaults.
+- `config.local.json` — all personal settings and API keys; created
+  automatically and ignored.
 - `config.local.example.json` — safe example file.
 
 To open an application, add its absolute `.exe` path to **Assistant → Access

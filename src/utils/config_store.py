@@ -54,17 +54,14 @@ def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
 class ConfigStore(QObject):
     """Thread-safe public/local settings store.
 
-    ``config.json`` contains shareable settings and defaults. API keys are
-    written only to the git-ignored ``config.local.json``.
+    ``config.json`` contains versioned defaults. All choices made in the UI,
+    including secrets, are written to the git-ignored ``config.local.json``.
+    This keeps the repository clean and prevents an update from replacing a
+    user's camera, voice, permissions, commands, or API keys.
     """
 
     changed = pyqtSignal(str, object)
     saved = pyqtSignal()
-
-    SECRET_KEYS = {
-        "assistant.api_keys.openrouter",
-        "assistant.api_keys.custom",
-    }
 
     def __init__(
         self,
@@ -111,8 +108,7 @@ class ConfigStore(QObject):
 
     def set(self, dotted_key: str, value: Any, *, save: bool = True) -> None:
         with self._lock:
-            target = self._local if dotted_key in self.SECRET_KEYS else self._public
-            self._put(target, dotted_key, value)
+            self._put(self._local, dotted_key, value)
             self._put(self._data, dotted_key, value)
             if save:
                 self._save_locked()
@@ -121,14 +117,13 @@ class ConfigStore(QObject):
     def update_many(self, values: Dict[str, Any]) -> None:
         with self._lock:
             for key, value in values.items():
-                target = self._local if key in self.SECRET_KEYS else self._public
-                self._put(target, key, value)
+                self._put(self._local, key, value)
                 self._put(self._data, key, value)
             self._save_locked()
         for key, value in values.items():
             self.changed.emit(key, deepcopy(value))
 
-    def replace_section(self, section: str, value: Any, *, local: bool = False) -> None:
+    def replace_section(self, section: str, value: Any, *, local: bool = True) -> None:
         with self._lock:
             target = self._local if local else self._public
             target[section] = deepcopy(value)
@@ -141,7 +136,8 @@ class ConfigStore(QObject):
             self._save_locked()
 
     def _save_locked(self) -> None:
-        _write_json_atomic(self.public_path, self._public)
+        # Versioned defaults are read-only during normal application use.
+        # ``save`` therefore cannot accidentally publish personal paths/keys.
         if self._local:
             _write_json_atomic(self.local_path, self._local)
         self.saved.emit()

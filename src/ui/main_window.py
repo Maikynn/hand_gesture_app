@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import signal
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+# Load MediaPipe's native runtime before Qt. On Windows, loading Qt5 first can
+# make _framework_bindings fail or crash later inside MSVCP140.dll.
+from camera.skeleton_renderer import SkeletonRenderer
+
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtGui import QImage, QKeySequence, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -23,6 +29,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QShortcut,
     QSizePolicy,
     QSlider,
     QStackedWidget,
@@ -33,7 +40,6 @@ from PyQt5.QtWidgets import (
 )
 
 from assistant.actions import ACTION_LABELS, ActionExecutor
-from camera.skeleton_renderer import SkeletonRenderer
 from camera.video_capture import VideoCapture
 from hand_processing.gesture_recognizer import GestureRecognizer
 from ui.assistant_window import AssistantWindow
@@ -279,6 +285,11 @@ class CameraWidget(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.process_frame)
         self._last_inference = 0.0
+        self._processing = False
+        self._camera_paused = False
+        self._consecutive_errors = 0
+        self._frame_times: List[float] = []
+        self._last_hand_count = 0
         self._hand_state: Dict[str, Dict[str, Any]] = {
             "Left": {"gesture": "", "count": 0, "fired": False},
             "Right": {"gesture": "", "count": 0, "fired": False},
@@ -303,11 +314,28 @@ class CameraWidget(QWidget):
         title_box = QVBoxLayout()
         title = QLabel("Камера")
         title.setObjectName("PageTitle")
-        subtitle = QLabel("Большой кадр, две руки и действия без лишних окон")
+        subtitle = QLabel("Покажи руки — Jarvis распознает жесты и выполнит только разрешённые действия")
         subtitle.setObjectName("PageSubtitle")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         header.addLayout(title_box, 1)
+        self.performance_status = QLabel("Ожидание кадра")
+        self.performance_status.setObjectName("StatusNeutral")
+        header.addWidget(self.performance_status)
+        self.actions_toggle = QPushButton("Управление жестами: выкл")
+        self.actions_toggle.setCheckable(True)
+        self.actions_toggle.setChecked(bool(self.settings.get("actions_enabled", False)))
+        self.actions_toggle.setProperty("secondary", True)
+        self.actions_toggle.setToolTip(
+            "Распознавание работает всегда. Действия выполняются только когда переключатель включён."
+        )
+        self.actions_toggle.toggled.connect(self._toggle_actions)
+        self._set_actions_toggle_text(self.actions_toggle.isChecked())
+        header.addWidget(self.actions_toggle)
+        self.pause_button = QPushButton("Пауза")
+        self.pause_button.setProperty("secondary", True)
+        self.pause_button.clicked.connect(self._toggle_camera_pause)
+        header.addWidget(self.pause_button)
         self.camera_status = QLabel("Камера подключена" if self.video_capture.is_open else "Нет камеры")
         self.camera_status.setObjectName(
             "StatusGood" if self.video_capture.is_open else "StatusBad"
@@ -385,7 +413,7 @@ class CameraWidget(QWidget):
 
         toggles = QVBoxLayout()
         self.mirror = QCheckBox("Зеркальное изображение")
-        self.show_hands = QCheckBox("Скелет рук")
+        self.show_hands = QCheckBox("Рисовать скелет рук")
         self.show_face = QCheckBox("Сетка лица")
         self.show_pose = QCheckBox("Скелет тела")
         self.mirror.setChecked(bool(self.settings.get("mirror", True)))
@@ -400,10 +428,41 @@ class CameraWidget(QWidget):
 
     def start(self) -> None:
         if not self.timer.isActive():
-            self.timer.start(30)
+            self.timer.start(33)
 
     def stop(self) -> None:
         self.timer.stop()
+
+    def _toggle_actions(self, enabled: bool) -> None:
+        self._set_actions_toggle_text(enabled)
+        self.store.set("camera.actions_enabled", enabled)
+        if not enabled:
+            for state in self._hand_state.values():
+                state.update({"gesture": "", "count": 0, "fired": False})
+        self._set_camera_status(
+            "good" if enabled else "warn",
+            "Жестовые действия включены" if enabled else "Безопасный режим: действия выключены",
+        )
+
+    def _set_actions_toggle_text(self, enabled: bool) -> None:
+        self.actions_toggle.setText(
+            "Управление жестами: вкл" if enabled else "Управление жестами: выкл"
+        )
+        self.actions_toggle.setProperty("accent", enabled)
+        self.actions_toggle.style().unpolish(self.actions_toggle)
+        self.actions_toggle.style().polish(self.actions_toggle)
+
+    def _toggle_camera_pause(self) -> None:
+        self._camera_paused = not self._camera_paused
+        if self._camera_paused:
+            self.stop()
+            self.pause_button.setText("Продолжить")
+            self.performance_status.setText("Камера на паузе")
+            self._set_camera_status("warn", "Камера приостановлена")
+        else:
+            self.pause_button.setText("Пауза")
+            self.start()
+            self._set_camera_status("good", "Камера продолжила работу")
 
     def _change_camera(self, *_args) -> None:
         new_id = int(self.camera_combo.currentData())
@@ -476,6 +535,36 @@ class CameraWidget(QWidget):
         self._set_camera_status("good", "Привязки жестов применены")
 
     def process_frame(self) -> None:
+        if self._processing or self._camera_paused:
+            return
+        self._processing = True
+        try:
+            self._process_frame_once()
+            self._consecutive_errors = 0
+        except Exception as exc:
+            self._consecutive_errors += 1
+            self.logger.exception("Camera frame processing failed")
+            self._set_camera_status("bad", f"Ошибка кадра: {exc}")
+            if self._consecutive_errors >= 3:
+                # A damaged native graph must not be reused indefinitely.
+                try:
+                    self.renderer.release()
+                except Exception:
+                    pass
+                try:
+                    self.renderer = SkeletonRenderer()
+                except Exception as restart_error:
+                    self.stop()
+                    self._set_camera_status(
+                        "bad", f"MediaPipe остановлен: {restart_error}"
+                    )
+                else:
+                    self._consecutive_errors = 0
+                    self._set_camera_status("warn", "MediaPipe перезапущен после ошибки")
+        finally:
+            self._processing = False
+
+    def _process_frame_once(self) -> None:
         ok, frame = self.video_capture.read_frame()
         if not ok or frame is None:
             self.video.setText("Нет сигнала с камеры")
@@ -498,27 +587,45 @@ class CameraWidget(QWidget):
             )
             self._update_hands(frame, landmarks)
         self.set_image(self.video, frame)
+        self._update_performance()
+
+    def _update_performance(self) -> None:
+        now = time.monotonic()
+        self._frame_times.append(now)
+        cutoff = now - 1.0
+        self._frame_times = [stamp for stamp in self._frame_times if stamp >= cutoff]
+        fps = max(0, len(self._frame_times) - 1)
+        suffix = "рука" if self._last_hand_count == 1 else "руки"
+        self.performance_status.setText(f"{fps} FPS · {self._last_hand_count} {suffix}")
 
     def _update_hands(self, frame: np.ndarray, landmarks: Dict[str, Any]) -> None:
         seen = set()
         raw_hands = landmarks.get("raw_hands", [])
         handedness = landmarks.get("handedness", [])
         pixel_hands = landmarks.get("hands", [])
+        self._last_hand_count = min(2, len(raw_hands))
         for index, raw_hand in enumerate(raw_hands[:2]):
-            side = str(handedness[index] if index < len(handedness) else "Unknown")
-            if side not in {"Left", "Right"}:
-                side = "Left" if "Left" not in seen else "Right"
-            seen.add(side)
-            coords = pixel_hands[index] if index < len(pixel_hands) else []
-            crop = self._crop(frame, coords, self.padding.value())
-            if crop is None:
-                continue
-            gesture, _palm_side = self.recognizer.recognize_gesture(crop, raw_hand)
-            gesture = CANONICAL_GESTURE.get(gesture, gesture)
-            confidence = 0.9 if gesture not in {"unknown", "no_gesture"} else 0.4
-            preview = self.left_hand if side == "Left" else self.right_hand
-            preview.update_hand("Левая" if side == "Left" else "Правая", gesture, confidence, crop)
-            self._stabilize_and_fire(side, gesture, confidence)
+            try:
+                if not getattr(raw_hand, "landmark", None) or len(raw_hand.landmark) < 21:
+                    continue
+                side = str(handedness[index] if index < len(handedness) else "Unknown")
+                if side not in {"Left", "Right"}:
+                    side = "Left" if "Left" not in seen else "Right"
+                seen.add(side)
+                coords = pixel_hands[index] if index < len(pixel_hands) else []
+                crop = self._crop(frame, coords, self.padding.value())
+                if crop is None:
+                    continue
+                gesture, _palm_side = self.recognizer.recognize_gesture(crop, raw_hand)
+                gesture = CANONICAL_GESTURE.get(gesture, gesture)
+                confidence = 0.9 if gesture not in {"unknown", "no_gesture"} else 0.4
+                preview = self.left_hand if side == "Left" else self.right_hand
+                preview.update_hand(
+                    "Левая" if side == "Left" else "Правая", gesture, confidence, crop
+                )
+                self._stabilize_and_fire(side, gesture, confidence)
+            except Exception:
+                self.logger.exception("Failed to process detected hand %s", index)
         if "Left" not in seen:
             self.left_hand.clear_hand("Левая")
             self._stabilize_and_fire("Left", "no_gesture", 0.0)
@@ -555,6 +662,8 @@ class CameraWidget(QWidget):
         stable_frames = int(self.store.get("camera.stable_frames", 3))
         if state["count"] < stable_frames or state["fired"]:
             return
+        if not self.actions_toggle.isChecked():
+            return
         for binding in self.bindings:
             if not binding.get("enabled", True) or binding.get("gesture") != gesture:
                 continue
@@ -585,9 +694,10 @@ class CameraWidget(QWidget):
 
     @staticmethod
     def set_image(label: QLabel, rgb: np.ndarray) -> None:
+        rgb = np.require(rgb, dtype=np.uint8, requirements=["C"])
         height, width, channels = rgb.shape
         image = QImage(
-            rgb.data, width, height, channels * width, QImage.Format_RGB888
+            rgb.data, width, height, int(rgb.strides[0]), QImage.Format_RGB888
         ).copy()
         label.setPixmap(
             QPixmap.fromImage(image).scaled(
@@ -616,6 +726,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.camera_page)
         self.stack.addWidget(self.assistant_page)
         self._build_shell()
+        self._install_shortcuts()
         self.camera_page.status_changed.connect(self._status)
         self.assistant_page.status_changed.connect(self._status)
         self.camera_page.start()
@@ -642,8 +753,8 @@ class MainWindow(QMainWindow):
         side.addWidget(brand)
         side.addWidget(caption)
         side.addSpacing(20)
-        self.camera_button = QPushButton("Камера\nжесты и действия")
-        self.assistant_button = QPushButton("Помощник\nчат и настройки")
+        self.camera_button = QPushButton("◉  Камера\nжесты и действия")
+        self.assistant_button = QPushButton("✦  Помощник\nчат и настройки")
         for button in (self.camera_button, self.assistant_button):
             button.setCheckable(True)
             button.setMinimumHeight(60)
@@ -653,6 +764,10 @@ class MainWindow(QMainWindow):
         self.camera_button.clicked.connect(lambda: self._show_page(0))
         self.assistant_button.clicked.connect(lambda: self._show_page(1))
         side.addStretch(1)
+        shortcuts = QLabel("Ctrl+1  Камера\nCtrl+2  Помощник\nCtrl+T  Тема\nCtrl+P  Пауза")
+        shortcuts.setProperty("muted", True)
+        shortcuts.setToolTip("Быстрые клавиши доступны из любой вкладки")
+        side.addWidget(shortcuts)
         self.theme_button = QPushButton("☀ Светлая тема")
         self.theme_button.setProperty("secondary", True)
         self.theme_button.clicked.connect(self._toggle_theme)
@@ -665,6 +780,19 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.stack, 1)
         self.setCentralWidget(central)
         self._sync_theme_button()
+
+    def _install_shortcuts(self) -> None:
+        bindings = (
+            ("Ctrl+1", lambda: self._show_page(0)),
+            ("Ctrl+2", lambda: self._show_page(1)),
+            ("Ctrl+T", self._toggle_theme),
+            ("Ctrl+P", self.camera_page._toggle_camera_pause),
+        )
+        self._shortcuts = []
+        for sequence, callback in bindings:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.activated.connect(callback)
+            self._shortcuts.append(shortcut)
 
     def _show_page(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
@@ -703,7 +831,14 @@ def main() -> None:
     app.setStyle("Fusion")
     window = MainWindow()
     window.show()
-    sys.exit(app.exec_())
+    # Let Ctrl+C from run.bat close native camera/MediaPipe resources cleanly.
+    signal.signal(signal.SIGINT, lambda *_args: window.close())
+    signal_pump = QTimer()
+    signal_pump.timeout.connect(lambda: None)
+    signal_pump.start(400)
+    exit_code = app.exec_()
+    window.close()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

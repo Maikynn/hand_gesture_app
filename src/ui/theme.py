@@ -12,6 +12,7 @@ QWidget {
     font-size: 10.5pt;
 }
 QMainWindow, QScrollArea, QScrollArea > QWidget > QWidget { background: #0b1020; }
+QLabel, QCheckBox, QRadioButton { background: transparent; }
 #Sidebar { background: #10172a; border-right: 1px solid #27324a; }
 #Brand { font-size: 19pt; font-weight: 700; color: #78a8ff; }
 #BrandCaption, [muted="true"] { color: #8f9bb3; }
@@ -33,6 +34,7 @@ QMainWindow, QScrollArea, QScrollArea > QWidget > QWidget { background: #0b1020;
     border-radius: 12px;
 }
 #StatusGood { color: #6ee7a8; font-weight: 600; }
+#StatusNeutral { color: #9fb0cc; font-weight: 600; }
 #StatusWarn { color: #ffc96b; font-weight: 600; }
 #StatusBad { color: #ff7b88; font-weight: 600; }
 QPushButton {
@@ -50,6 +52,10 @@ QPushButton:disabled { background: #303a50; color: #7f899d; }
 QPushButton[secondary="true"] {
     background: #1b2740;
     border: 1px solid #34476b;
+}
+QPushButton[accent="true"] {
+    background: #167b58;
+    border: 1px solid #55dca6;
 }
 QPushButton[danger="true"] { background: #9f3042; }
 QLineEdit, QTextEdit, QTextBrowser, QPlainTextEdit, QComboBox,
@@ -97,6 +103,7 @@ QWidget {
     font-size: 10.5pt;
 }
 QMainWindow, QScrollArea, QScrollArea > QWidget > QWidget { background: #f4f7fb; }
+QLabel, QCheckBox, QRadioButton { background: transparent; }
 #Sidebar { background: #ffffff; border-right: 1px solid #d9e2ef; }
 #Brand { font-size: 19pt; font-weight: 700; color: #245ec7; }
 #BrandCaption, [muted="true"] { color: #64748b; }
@@ -118,6 +125,7 @@ QMainWindow, QScrollArea, QScrollArea > QWidget > QWidget { background: #f4f7fb;
     border-radius: 12px;
 }
 #StatusGood { color: #14804a; font-weight: 600; }
+#StatusNeutral { color: #64748b; font-weight: 600; }
 #StatusWarn { color: #a66700; font-weight: 600; }
 #StatusBad { color: #b42335; font-weight: 600; }
 QPushButton {
@@ -135,6 +143,11 @@ QPushButton[secondary="true"] {
     background: #eaf0f9;
     color: #24344e;
     border: 1px solid #c2cee0;
+}
+QPushButton[accent="true"] {
+    background: #d9f6e8;
+    color: #11623f;
+    border: 1px solid #4fbd8c;
 }
 QPushButton[danger="true"] { background: #bd3b4e; }
 QLineEdit, QTextEdit, QTextBrowser, QPlainTextEdit, QComboBox,

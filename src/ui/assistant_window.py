@@ -36,7 +36,7 @@ from PyQt5.QtWidgets import (
 from assistant.actions import ACTION_LABELS, ActionExecutor
 from assistant.embedded_jarvis import AssistantResult, EmbeddedJarvis
 from assistant.listener import WakeWordListener
-from assistant.tts_engine import TTSEngine
+from assistant.tts_engine import NEURAL_VOICES, TTSEngine, list_voices
 from utils.config_store import ConfigStore
 
 
@@ -67,8 +67,11 @@ class AssistantWindow(QWidget):
         self.core = EmbeddedJarvis(self.store, executor=self.executor)
         assistant = self.store.get("assistant", {}) or {}
         self.tts = TTSEngine(
+            engine=str(assistant.get("tts_engine", "edge")),
+            voice_id=str(assistant.get("tts_voice", "ru-RU-DmitryNeural")),
             rate=int(assistant.get("tts_rate", 175)),
             volume=float(assistant.get("tts_volume", 0.9)),
+            pitch=int(assistant.get("tts_pitch", -12)),
         )
         self.listener = WakeWordListener(
             wake_word=str(assistant.get("wake_phrases", "джарвис, аксиос")),
@@ -260,12 +263,33 @@ class AssistantWindow(QWidget):
 
         self.continuous = QCheckBox("Обрабатывать речь без wake-фразы")
         form.addRow("", self.continuous)
-        self.tts_enabled = QCheckBox("Озвучивать ответы модели")
+        self.tts_enabled = QCheckBox("Озвучивать ответы Jarvis")
         form.addRow("", self.tts_enabled)
+
+        self.tts_engine = QComboBox()
+        self.tts_engine.addItem("Jarvis Neural · красивый онлайн-голос", "edge")
+        self.tts_engine.addItem("Windows · системный офлайн-голос", "system")
+        self.tts_engine.currentIndexChanged.connect(self._tts_engine_changed)
+        form.addRow("Голосовой движок", self.tts_engine)
+
+        voice_row = QHBoxLayout()
+        self.tts_voice = QComboBox()
+        for voice_id, label in NEURAL_VOICES:
+            self.tts_voice.addItem(label, voice_id)
+        test_voice = QPushButton("▶ Проверить")
+        test_voice.setProperty("secondary", True)
+        test_voice.clicked.connect(self._test_voice)
+        voice_row.addWidget(self.tts_voice, 1)
+        voice_row.addWidget(test_voice)
+        form.addRow("Голос", voice_row)
 
         self.tts_rate = QSlider(Qt.Horizontal)
         self.tts_rate.setRange(90, 260)
         form.addRow("Скорость речи", self.tts_rate)
+        self.tts_pitch = QSlider(Qt.Horizontal)
+        self.tts_pitch.setRange(-50, 50)
+        self.tts_pitch.setToolTip("Отрицательное значение делает голос глубже")
+        form.addRow("Глубина голоса", self.tts_pitch)
         self.tts_volume = QSlider(Qt.Horizontal)
         self.tts_volume.setRange(0, 100)
         form.addRow("Громкость TTS", self.tts_volume)
@@ -371,8 +395,14 @@ class AssistantWindow(QWidget):
         self.mic_gain.setValue(float(assistant.get("microphone_gain", 1.0)))
         self.continuous.setChecked(bool(assistant.get("continuous_listening", False)))
         self.tts_enabled.setChecked(bool(assistant.get("tts_enabled", True)))
+        self._set_combo_data(self.tts_engine, assistant.get("tts_engine", "edge"))
+        self._set_combo_data(
+            self.tts_voice, assistant.get("tts_voice", "ru-RU-DmitryNeural")
+        )
         self.tts_rate.setValue(int(assistant.get("tts_rate", 175)))
+        self.tts_pitch.setValue(int(assistant.get("tts_pitch", -12)))
         self.tts_volume.setValue(int(float(assistant.get("tts_volume", 0.9)) * 100))
+        self._tts_engine_changed()
         self._set_combo_data(self.provider, assistant.get("llm_provider", "none"))
         self.max_tokens.setValue(int(assistant.get("max_tokens", 350)))
         self.system_prompt.setPlainText(str(assistant.get("system_prompt", "")))
@@ -398,6 +428,42 @@ class AssistantWindow(QWidget):
             self.microphone.addItem(str(item["name"]), int(item["index"]))
         index = self.microphone.findData(selected if selected is not None else -1)
         self.microphone.setCurrentIndex(max(0, index))
+
+    def _tts_engine_changed(self, *_args) -> None:
+        neural = str(self.tts_engine.currentData()) == "edge"
+        selected = self.tts_voice.currentData()
+        choices = NEURAL_VOICES if neural else list_voices()
+        self.tts_voice.blockSignals(True)
+        self.tts_voice.clear()
+        if choices:
+            for voice_id, label in choices:
+                self.tts_voice.addItem(label, voice_id)
+        else:
+            self.tts_voice.addItem("Автовыбор системного голоса", "")
+        index = self.tts_voice.findData(selected)
+        self.tts_voice.setCurrentIndex(max(0, index))
+        self.tts_voice.blockSignals(False)
+        self.tts_voice.setEnabled(bool(choices))
+        self.tts_pitch.setEnabled(neural)
+        self.tts_engine.setToolTip(
+            "Neural требует интернет и автоматически переключается на Windows при ошибке."
+            if neural
+            else "Системный голос работает без интернета."
+        )
+
+    def _test_voice(self) -> None:
+        self.tts.stop()
+        self.tts.configure(
+            engine=str(self.tts_engine.currentData()),
+            voice_id=str(self.tts_voice.currentData()),
+            rate=self.tts_rate.value(),
+            volume=self.tts_volume.value() / 100.0,
+            pitch=self.tts_pitch.value(),
+        )
+        self.tts.speak(
+            "Добрый вечер. Системы работают штатно. Я готов к вашим командам."
+        )
+        self._set_status("good", "Воспроизвожу тест голоса")
 
     def _provider_changed(self, *_args) -> None:
         previous = self._active_provider
@@ -567,7 +633,10 @@ class AssistantWindow(QWidget):
             "assistant.microphone_gain": float(self.mic_gain.value()),
             "assistant.continuous_listening": self.continuous.isChecked(),
             "assistant.tts_enabled": self.tts_enabled.isChecked(),
+            "assistant.tts_engine": str(self.tts_engine.currentData()),
+            "assistant.tts_voice": str(self.tts_voice.currentData()),
             "assistant.tts_rate": self.tts_rate.value(),
+            "assistant.tts_pitch": self.tts_pitch.value(),
             "assistant.tts_volume": self.tts_volume.value() / 100.0,
             "assistant.llm_provider": provider,
             "assistant.max_tokens": self.max_tokens.value(),
@@ -595,8 +664,13 @@ class AssistantWindow(QWidget):
             mic_index=self._mic_index(self.microphone.currentData()),
             gain=self.mic_gain.value(),
         )
-        self.tts.set_rate(self.tts_rate.value())
-        self.tts.set_volume(self.tts_volume.value() / 100.0)
+        self.tts.configure(
+            engine=str(self.tts_engine.currentData()),
+            voice_id=str(self.tts_voice.currentData()),
+            rate=self.tts_rate.value(),
+            volume=self.tts_volume.value() / 100.0,
+            pitch=self.tts_pitch.value(),
+        )
         self._set_status("good", "Настройки применены")
 
     def _send(self) -> None:
