@@ -31,6 +31,7 @@ The camera page provides:
 - camera selection, brightness, mirroring, crop padding, and skeleton toggles;
 - rule-based MediaPipe recognition by default;
 - optional built-in or user-selected ONNX/TFLite models;
+- bundled YOLO HaGRID model with a selectable `.pt` path;
 - stable-frame filtering and one action per held gesture;
 - safe mode: gesture actions stay off until explicitly enabled;
 - application, URL, hotkey, and safe built-in system actions.
@@ -50,6 +51,7 @@ The assistant page contains:
 - original Priler/Jarvis Russian reaction sounds;
 - a deep Microsoft neural Russian voice with speed, pitch, and volume controls;
 - automatic offline Windows voice fallback when the network is unavailable;
+- visible synthesis/playback/fallback/error status and repeat-safe voice tests;
 - OpenRouter, local Ollama, or any OpenAI-compatible API;
 - configurable humorous fallback phrases when no model is available.
 

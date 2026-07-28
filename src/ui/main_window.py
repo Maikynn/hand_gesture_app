@@ -3,6 +3,7 @@ from __future__ import annotations
 import signal
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -42,6 +43,8 @@ from PyQt5.QtWidgets import (
 from assistant.actions import ACTION_LABELS, ActionExecutor
 from camera.video_capture import VideoCapture
 from hand_processing.gesture_recognizer import GestureRecognizer
+from hand_processing.gesture_fusion import HAGRID_CLASSES
+from hand_processing.static_yolo import DEFAULT_YOLO_MODEL, YOLOStaticModel
 from ui.assistant_window import AssistantWindow
 from ui.theme import apply_theme
 from utils.config_store import ConfigStore
@@ -280,6 +283,8 @@ class CameraWidget(QWidget):
         self.renderer = SkeletonRenderer()
         self.model_manager = ModelManager()
         self.recognizer = GestureRecognizer(self.model_manager)
+        self.yolo_model: Optional[YOLOStaticModel] = None
+        self._model_loading = False
         self.executor = ActionExecutor(self.store.get("permissions", []))
         self.bindings = list(self.store.get("gesture_bindings", []))
         self.timer = QTimer(self)
@@ -297,6 +302,8 @@ class CameraWidget(QWidget):
         self._last_action: Dict[Tuple[str, str], float] = {}
         self._build_ui()
         self.store.changed.connect(self._store_changed)
+        if self.model_combo.currentData() == "yolo":
+            QTimer.singleShot(0, self._change_model)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -380,22 +387,30 @@ class CameraWidget(QWidget):
 
         self.model_combo = QComboBox()
         self.model_combo.addItem("Быстрые правила · MediaPipe", "rules")
+        self.model_combo.addItem("YOLO HaGRID · нейросеть", "yolo")
         self.model_combo.addItem("Встроенная ONNX/TFLite", "built_in")
         self.model_combo.addItem("Своя ONNX/TFLite", "custom")
         index = self.model_combo.findData(str(self.settings.get("model", "rules")))
         self.model_combo.setCurrentIndex(max(0, index))
-        self.model_combo.currentIndexChanged.connect(self._change_model)
+        self.model_combo.currentIndexChanged.connect(self._model_selection_changed)
         form.addRow("Модель", self.model_combo)
 
         model_path_row = QHBoxLayout()
-        self.model_path = QLineEdit(str(self.settings.get("custom_model_path", "")))
-        choose = QPushButton("…")
-        choose.setFixedWidth(42)
-        choose.setProperty("secondary", True)
-        choose.clicked.connect(self._choose_model)
+        initial_model = str(self.model_combo.currentData())
+        initial_path = (
+            self.settings.get("yolo_model_path", DEFAULT_YOLO_MODEL)
+            if initial_model == "yolo"
+            else self.settings.get("custom_model_path", "")
+        )
+        self.model_path = QLineEdit(str(initial_path))
+        self.choose_model_button = QPushButton("…")
+        self.choose_model_button.setFixedWidth(42)
+        self.choose_model_button.setProperty("secondary", True)
+        self.choose_model_button.clicked.connect(self._choose_model)
         model_path_row.addWidget(self.model_path, 1)
-        model_path_row.addWidget(choose)
+        model_path_row.addWidget(self.choose_model_button)
         form.addRow("Файл модели", model_path_row)
+        self._sync_model_path_controls()
         row.addLayout(form, 2)
 
         sliders = QFormLayout()
@@ -478,26 +493,80 @@ class CameraWidget(QWidget):
         )
 
     def _choose_model(self) -> None:
+        yolo = self.model_combo.currentData() == "yolo"
         path, _ = QFileDialog.getOpenFileName(
-            self, "Выберите модель жестов", "", "Модели (*.onnx *.tflite)"
+            self,
+            "Выберите модель жестов",
+            "",
+            "YOLO (*.pt)" if yolo else "Модели (*.onnx *.tflite)",
         )
         if path:
             self.model_path.setText(path)
-            self.model_combo.setCurrentIndex(self.model_combo.findData("custom"))
+            if not yolo:
+                self.model_combo.setCurrentIndex(self.model_combo.findData("custom"))
             self._change_model()
+
+    def _model_selection_changed(self, *_args) -> None:
+        model = str(self.model_combo.currentData())
+        if model == "yolo":
+            self.model_path.setText(
+                str(self.store.get("camera.yolo_model_path", DEFAULT_YOLO_MODEL))
+            )
+        elif model == "custom":
+            self.model_path.setText(
+                str(self.store.get("camera.custom_model_path", ""))
+            )
+        self._sync_model_path_controls()
+        self._change_model()
+
+    def _sync_model_path_controls(self) -> None:
+        selectable = self.model_combo.currentData() in {"yolo", "custom"}
+        self.model_path.setEnabled(selectable)
+        self.choose_model_button.setEnabled(selectable)
 
     def _change_model(self, *_args) -> None:
         model = str(self.model_combo.currentData())
-        self.store.update_many(
-            {
-                "camera.model": model,
-                "camera.custom_model_path": self.model_path.text().strip(),
-            }
-        )
+        values = {"camera.model": model}
+        if model == "yolo":
+            values["camera.yolo_model_path"] = (
+                self.model_path.text().strip() or DEFAULT_YOLO_MODEL
+            )
+        elif model == "custom":
+            values["camera.custom_model_path"] = self.model_path.text().strip()
+        self.store.update_many(values)
         if model == "rules":
+            self.yolo_model = None
             self.recognizer.has_model = False
             self._set_camera_status("good", "Модель: быстрые правила")
             return
+        if model == "yolo":
+            path = str(values["camera.yolo_model_path"])
+            if self.yolo_model is not None and self.yolo_model.loaded:
+                resolved = self.yolo_model.resolved_path
+                if resolved and Path(resolved).resolve() == Path(path).resolve():
+                    self._set_camera_status("good", "YOLO HaGRID уже загружен")
+                    return
+            if self._model_loading:
+                return
+            self._model_loading = True
+            self._set_camera_status("warn", "Загружаю YOLO HaGRID…")
+            try:
+                candidate = YOLOStaticModel(path, HAGRID_CLASSES)
+                if candidate.ensure_loaded():
+                    self.yolo_model = candidate
+                    self.recognizer.has_model = False
+                    resolved = candidate.resolved_path or path
+                    self.model_path.setText(resolved)
+                    self._set_camera_status("good", "YOLO HaGRID загружен")
+                else:
+                    self.yolo_model = None
+                    self._set_camera_status(
+                        "warn", "YOLO недоступен — временно использую правила MediaPipe"
+                    )
+            finally:
+                self._model_loading = False
+            return
+        self.yolo_model = None
         if model == "built_in":
             self.recognizer.model = self.model_manager.get_current_model()
             self.recognizer.has_model = self.recognizer.model is not None
@@ -577,6 +646,12 @@ class CameraWidget(QWidget):
 
         now = time.monotonic()
         interval = int(self.store.get("camera.inference_interval_ms", 100)) / 1000.0
+        if self.model_combo.currentData() == "yolo":
+            interval = max(
+                interval,
+                int(self.store.get("camera.yolo_inference_interval_ms", 180))
+                / 1000.0,
+            )
         if now - self._last_inference >= interval:
             self._last_inference = now
             frame, landmarks, _ = self.renderer.process_frame(
@@ -616,9 +691,8 @@ class CameraWidget(QWidget):
                 crop = self._crop(frame, coords, self.padding.value())
                 if crop is None:
                     continue
-                gesture, _palm_side = self.recognizer.recognize_gesture(crop, raw_hand)
-                gesture = CANONICAL_GESTURE.get(gesture, gesture)
-                confidence = 0.9 if gesture not in {"unknown", "no_gesture"} else 0.4
+                prediction = self._recognize_crop(crop, raw_hand)
+                gesture, confidence = prediction
                 preview = self.left_hand if side == "Left" else self.right_hand
                 preview.update_hand(
                     "Левая" if side == "Left" else "Правая", gesture, confidence, crop
@@ -632,6 +706,22 @@ class CameraWidget(QWidget):
         if "Right" not in seen:
             self.right_hand.clear_hand("Правая")
             self._stabilize_and_fire("Right", "no_gesture", 0.0)
+
+    def _recognize_crop(self, crop: np.ndarray, raw_hand: Any) -> Tuple[str, float]:
+        if self.model_combo.currentData() == "yolo" and self.yolo_model is not None:
+            probabilities = self.yolo_model.predict_probs(
+                crop, input_is_rgb=True
+            )
+            if probabilities is not None and probabilities.size:
+                index = int(np.argmax(probabilities))
+                confidence = float(probabilities[index])
+                if 0 <= index < len(HAGRID_CLASSES) and confidence >= 0.25:
+                    gesture = HAGRID_CLASSES[index]
+                    return CANONICAL_GESTURE.get(gesture, gesture), confidence
+        gesture, _palm_side = self.recognizer.recognize_gesture(crop, raw_hand)
+        gesture = CANONICAL_GESTURE.get(gesture, gesture)
+        confidence = 0.9 if gesture not in {"unknown", "no_gesture"} else 0.4
+        return gesture, confidence
 
     @staticmethod
     def _crop(frame: np.ndarray, points: List[Tuple[int, int]], padding: int) -> Optional[np.ndarray]:

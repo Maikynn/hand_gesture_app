@@ -38,3 +38,11 @@ implementation does not require those objects.
 The Russian Vosk speech-recognition model under `models/vosk-ru` originated
 from the Priler/Jarvis resource snapshot. Vosk models and toolkit components
 retain their upstream notices and licensing terms.
+
+## Ultralytics YOLO
+
+The optional HaGRID neural gesture backend uses the separately installed
+[Ultralytics](https://github.com/ultralytics/ultralytics) Python runtime.
+Ultralytics is distributed under AGPL-3.0 unless covered by a separate
+enterprise license. The bundled `models/yolo/hagrid_best.pt` contains the
+project's trained gesture weights and is loaded only when YOLO is selected.

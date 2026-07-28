@@ -53,6 +53,7 @@ class AssistantSignals(QObject):
     result_ready = pyqtSignal(object)
     recognized = pyqtSignal(str)
     listener_status = pyqtSignal(str, str)
+    tts_status = pyqtSignal(str, str)
 
 
 class AssistantWindow(QWidget):
@@ -66,12 +67,14 @@ class AssistantWindow(QWidget):
         self.executor = ActionExecutor(self.store.get("permissions", []))
         self.core = EmbeddedJarvis(self.store, executor=self.executor)
         assistant = self.store.get("assistant", {}) or {}
+        self.signals = AssistantSignals()
         self.tts = TTSEngine(
             engine=str(assistant.get("tts_engine", "edge")),
             voice_id=str(assistant.get("tts_voice", "ru-RU-DmitryNeural")),
             rate=int(assistant.get("tts_rate", 175)),
             volume=float(assistant.get("tts_volume", 0.9)),
             pitch=int(assistant.get("tts_pitch", -12)),
+            on_event=self.signals.tts_status.emit,
         )
         self.listener = WakeWordListener(
             wake_word=str(assistant.get("wake_phrases", "джарвис, аксиос")),
@@ -80,10 +83,10 @@ class AssistantWindow(QWidget):
             mic_index=self._mic_index(assistant.get("microphone_index", -1)),
             gain=float(assistant.get("microphone_gain", 1.0)),
         )
-        self.signals = AssistantSignals()
         self.signals.result_ready.connect(self._finish_result)
         self.signals.recognized.connect(self._handle_recognized)
         self.signals.listener_status.connect(self._listener_status)
+        self.signals.tts_status.connect(self._tts_status)
         self._busy = False
         self._active_provider = str(assistant.get("llm_provider", "none"))
         self._draft_keys = {
@@ -276,11 +279,11 @@ class AssistantWindow(QWidget):
         self.tts_voice = QComboBox()
         for voice_id, label in NEURAL_VOICES:
             self.tts_voice.addItem(label, voice_id)
-        test_voice = QPushButton("▶ Проверить")
-        test_voice.setProperty("secondary", True)
-        test_voice.clicked.connect(self._test_voice)
+        self.test_voice = QPushButton("▶ Проверить")
+        self.test_voice.setProperty("secondary", True)
+        self.test_voice.clicked.connect(self._test_voice)
         voice_row.addWidget(self.tts_voice, 1)
-        voice_row.addWidget(test_voice)
+        voice_row.addWidget(self.test_voice)
         form.addRow("Голос", voice_row)
 
         self.tts_rate = QSlider(Qt.Horizontal)
@@ -463,7 +466,18 @@ class AssistantWindow(QWidget):
         self.tts.speak(
             "Добрый вечер. Системы работают штатно. Я готов к вашим командам."
         )
-        self._set_status("good", "Воспроизвожу тест голоса")
+
+    def _tts_status(self, state: str, message: str) -> None:
+        active = state in {"queued", "synthesizing", "playing", "fallback"}
+        self.test_voice.setEnabled(not active)
+        if state == "error":
+            self._set_status("bad", message)
+        elif state in {"fallback", "cancelled"}:
+            self._set_status("warn", message)
+        elif active:
+            self._set_status("warn" if state == "synthesizing" else "good", message)
+        elif state == "done":
+            self._set_status("good", message)
 
     def _provider_changed(self, *_args) -> None:
         previous = self._active_provider

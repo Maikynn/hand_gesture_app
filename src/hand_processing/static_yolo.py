@@ -14,6 +14,7 @@ fallback candidate locations, so the exact save path does not matter.
 """
 
 import os
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -22,9 +23,13 @@ import cv2
 
 # Fallback locations where the trained YOLO weights may appear.
 _FALLBACK_DIRS = [
+    str(Path(__file__).resolve().parents[2] / "models" / "yolo"),
     r"F:\MODELS\Model_lerning\hagrid_static_yolo-2",
     r"F:\MODELS\hagrid_static_yolo-2",
 ]
+DEFAULT_YOLO_MODEL = str(
+    Path(__file__).resolve().parents[2] / "models" / "yolo" / "hagrid_best.pt"
+)
 
 
 class YOLOStaticModel:
@@ -42,18 +47,22 @@ class YOLOStaticModel:
         candidates: list = []
 
         # 1) The configured path itself.
-        if os.path.isfile(self.model_path) and self.model_path.endswith(".pt"):
-            return self.model_path
-        if os.path.isdir(self.model_path):
+        configured = Path(self.model_path).expanduser()
+        if not configured.is_absolute():
+            configured = Path(__file__).resolve().parents[2] / configured
+        configured_path = str(configured)
+        if os.path.isfile(configured_path) and configured_path.endswith(".pt"):
+            return configured_path
+        if os.path.isdir(configured_path):
             candidates += [
-                os.path.join(self.model_path, "weights", "best.pt"),
-                os.path.join(self.model_path, "weights", "last.pt"),
-                os.path.join(self.model_path, "best.pt"),
-                os.path.join(self.model_path, "last.pt"),
+                os.path.join(configured_path, "weights", "best.pt"),
+                os.path.join(configured_path, "weights", "last.pt"),
+                os.path.join(configured_path, "best.pt"),
+                os.path.join(configured_path, "last.pt"),
             ]
-            for f in sorted(os.listdir(self.model_path)):
+            for f in sorted(os.listdir(configured_path)):
                 if f.endswith(".pt"):
-                    candidates.append(os.path.join(self.model_path, f))
+                    candidates.append(os.path.join(configured_path, f))
 
         # 2) Fallback directories (same search strategy).
         for d in _FALLBACK_DIRS:
@@ -113,8 +122,12 @@ class YOLOStaticModel:
             return "not_trained"
         return "pending"
 
+    @property
+    def resolved_path(self) -> Optional[str]:
+        return self._resolved_path
+
     # ----------------------------- inference -----------------------------
-    def predict_probs(self, crop_bgr: np.ndarray):
+    def predict_probs(self, crop: np.ndarray, *, input_is_rgb: bool = False):
         """
         Run inference on a BGR hand crop.
 
@@ -123,7 +136,11 @@ class YOLOStaticModel:
         """
         if not self.ensure_loaded() or self._model is None:
             return None
-        crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+        crop_rgb = (
+            np.ascontiguousarray(crop)
+            if input_is_rgb
+            else cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        )
         try:
             results = self._model(crop_rgb, verbose=False)
         except Exception as e:

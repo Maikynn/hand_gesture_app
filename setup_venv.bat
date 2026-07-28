@@ -9,17 +9,25 @@ if errorlevel 1 (
 )
 
 if not exist "venv\Scripts\python.exe" (
-  echo [1/3] Creating Python 3.12 environment on this drive...
+  echo [1/4] Creating Python 3.12 environment on this drive...
   py -3.12 -m venv venv
   if errorlevel 1 exit /b 1
 )
 
-echo [2/3] Updating pip...
+echo [2/4] Updating pip...
 "venv\Scripts\python.exe" -m pip install --upgrade pip
 if errorlevel 1 exit /b 1
 
-echo [3/3] Installing application dependencies...
+echo [3/4] Installing application dependencies...
 "venv\Scripts\python.exe" -m pip install -r requirements.txt
+if errorlevel 1 exit /b 1
+
+echo [4/4] Installing CPU-only YOLO runtime without a duplicate OpenCV package...
+"venv\Scripts\python.exe" -m pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu
+if errorlevel 1 exit /b 1
+"venv\Scripts\python.exe" -m pip install pyyaml psutil py-cpuinfo polars ultralytics-thop nvidia-ml-py
+if errorlevel 1 exit /b 1
+"venv\Scripts\python.exe" -m pip install --no-deps ultralytics==8.4.102
 if errorlevel 1 exit /b 1
 
 echo.

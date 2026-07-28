@@ -11,9 +11,11 @@
     "show_face": false,
     "show_pose": false,
     "crop_padding": 34,
-    "model": "rules",
+    "model": "yolo",
     "custom_model_path": "",
+    "yolo_model_path": "models/yolo/hagrid_best.pt",
     "inference_interval_ms": 100,
+    "yolo_inference_interval_ms": 180,
     "stable_frames": 3,
     "release_frames": 3,
     "actions_enabled": false
