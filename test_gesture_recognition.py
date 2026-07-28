@@ -9,8 +9,6 @@ Note: In image coordinates, y increases downward.
 """
 
 import sys
-import os
-import numpy as np
 from pathlib import Path
 
 # Add src to path

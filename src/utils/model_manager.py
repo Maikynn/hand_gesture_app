@@ -4,8 +4,6 @@ Model management utilities for the Hand Gesture Application.
 Supports loading TFLite and ONNX models for gesture recognition.
 """
 
-import os
-import json
 import numpy as np
 from pathlib import Path
 from typing import Optional, List, Any

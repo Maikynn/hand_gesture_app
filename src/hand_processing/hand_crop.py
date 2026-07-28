@@ -6,7 +6,7 @@ Extracts and centers hand regions from video frames.
 
 import cv2
 import numpy as np
-from typing import Optional, Tuple, Dict, List, Union
+from typing import Optional, Dict, List, Union
 
 class HandCropProcessor:
     """

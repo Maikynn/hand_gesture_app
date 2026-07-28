@@ -30,9 +30,25 @@ import cv2
 # HaGRID class vocabulary (STRICTLY alphabetical, as seen by ImageFolder at train time)
 # ---------------------------------------------------------------------------
 HAGRID_CLASSES: List[str] = [
-    'call', 'dislike', 'fist', 'four', 'like', 'mute', 'no_gesture', 'ok', 'one',
-    'palm', 'peace', 'peace_inverted', 'rock', 'stop', 'stop_inverted',
-    'three', 'three2', 'two_up', 'two_up_inverted'
+    "call",
+    "dislike",
+    "fist",
+    "four",
+    "like",
+    "mute",
+    "no_gesture",
+    "ok",
+    "one",
+    "palm",
+    "peace",
+    "peace_inverted",
+    "rock",
+    "stop",
+    "stop_inverted",
+    "three",
+    "three2",
+    "two_up",
+    "two_up_inverted",
 ]
 
 # Default model / asset paths
@@ -71,39 +87,50 @@ class MediaPipeStaticClassifier:
         num = sum(fingers)
 
         # OK: thumb-index circle, other fingers extended
-        if self._dist(lm[THUMB_TIP], lm[INDEX_TIP]) < 0.05 and fingers[1] and fingers[2] and fingers[3]:
-            return 'ok'
+        if (
+            self._dist(lm[THUMB_TIP], lm[INDEX_TIP]) < 0.05
+            and fingers[1]
+            and fingers[2]
+            and fingers[3]
+        ):
+            return "ok"
         # Rock: index + pinky
         if fingers[0] and fingers[3] and not fingers[1] and not fingers[2]:
-            return 'rock'
+            return "rock"
         # Call: thumb + pinky
-        if thumb_ext and fingers[3] and not fingers[0] and not fingers[1] and not fingers[2]:
-            return 'call'
+        if (
+            thumb_ext
+            and fingers[3]
+            and not fingers[0]
+            and not fingers[1]
+            and not fingers[2]
+        ):
+            return "call"
         # Like: thumb up only
         if thumb_ext and num == 0 and lm[THUMB_TIP].y < lm[WRIST].y:
-            return 'like'
+            return "like"
         # Dislike: thumb down only
         if thumb_ext and num == 0 and lm[THUMB_TIP].y > lm[WRIST].y:
-            return 'dislike'
+            return "dislike"
         # One: index only
         if fingers[0] and num == 1:
-            return 'one'
+            return "one"
         # Two up: index + middle
         if fingers[0] and fingers[1] and not fingers[2] and not fingers[3]:
-            return 'two_up'
+            return "two_up"
         # Three: index + middle + ring
         if fingers[0] and fingers[1] and fingers[2] and not fingers[3]:
-            return 'three'
+            return "three"
         # Four: all four fingers extended
         if all(fingers):
-            return 'four'
+            return "four"
         # Fist: nothing extended
         if num == 0 and not thumb_ext:
-            return 'fist'
+            return "fist"
         # Palm / stop: all extended including thumb
         if all(fingers) and thumb_ext:
-            return 'palm'
-        return 'no_gesture'
+            return "palm"
+        return "no_gesture"
 
 
 class GestureFusion:
@@ -113,13 +140,16 @@ class GestureFusion:
     into the hand_gesture_app recognition pipeline.
     """
 
-    def __init__(self,
-                 ha_grid_model_path: str = None,
-                 hand_landmarker_path: str = DEFAULT_HAND_LANDMARKER,
-                 static_weight: float = 0.8,
-                 mediapipe_weight: float = 0.2,
-                 device: Optional[str] = None,
-                 dynamic_threshold: float = 0.6):
+    def __init__(
+        self,
+        ha_grid_model_path: str = None,
+        hand_landmarker_path: str = DEFAULT_HAND_LANDMARKER,
+        static_weight: float = 0.8,
+        mediapipe_weight: float = 0.2,
+        device: Optional[str] = None,
+        dynamic_threshold: float = 0.6,
+        load_static: bool = True,
+    ):
         # If ha_grid_model_path is None, fall back to DEFAULT_HAGRID_MODEL
         self.ha_grid_model_path = ha_grid_model_path or DEFAULT_HAGRID_MODEL
         self.hand_landmarker_path = hand_landmarker_path
@@ -131,22 +161,24 @@ class GestureFusion:
         self.classes = HAGRID_CLASSES
         self._class_to_idx = {c: i for i, c in enumerate(self.classes)}
 
-        self._model = None           # HaGRID PyTorch model
+        self._model = None  # HaGRID PyTorch model
         self._transform = None
         self._mp_classifier = MediaPipeStaticClassifier()
 
         # Static backend state (switchable between MobileNetV3, YOLO, Combined)
-        self._static_backend = 'mobilenet'   # 'mobilenet' | 'yolo' | 'combined'
-        self._yolo = None                    # YOLOStaticModel instance
+        self._static_backend = "mobilenet"  # 'mobilenet' | 'yolo' | 'combined'
+        self._yolo = None  # YOLOStaticModel instance
         self._yolo_path = None
 
-        self._load_static_model()
+        if load_static:
+            self._load_static_model()
 
     # --------------------------- static model ---------------------------
     @staticmethod
     def _default_device() -> str:
         try:
             import torch
+
             return "cuda" if torch.cuda.is_available() else "cpu"
         except Exception:
             return "cpu"
@@ -157,7 +189,9 @@ class GestureFusion:
             import torch.nn as nn
             from torchvision import models, transforms
         except Exception as e:
-            print(f"[GestureFusion] torch/torchvision unavailable, static model disabled: {e}")
+            print(
+                f"[GestureFusion] torch/torchvision unavailable, static model disabled: {e}"
+            )
             return
 
         num_classes = len(self.classes)
@@ -173,19 +207,27 @@ class GestureFusion:
             try:
                 state = torch.load(self.ha_grid_model_path, map_location=self.device)
                 model.load_state_dict(state)
-                print(f"[GestureFusion] HaGRID weights loaded: {self.ha_grid_model_path}")
+                print(
+                    f"[GestureFusion] HaGRID weights loaded: {self.ha_grid_model_path}"
+                )
             except Exception as e:
                 print(f"[GestureFusion] failed to load weights: {e}")
         else:
-            print(f"[GestureFusion] WARNING: weights not found at {self.ha_grid_model_path}")
+            print(
+                f"[GestureFusion] WARNING: weights not found at {self.ha_grid_model_path}"
+            )
         model = model.to(self.device)
         model.eval()
         self._model = model
-        self._transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+        self._transform = transforms.Compose(
+            [
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                ),
+            ]
+        )
 
     # --------------------------- static backend switch ---------------------------
     def use_yolo_static(self, model_path: str = DEFAULT_YOLO_STATIC_MODEL):
@@ -197,20 +239,25 @@ class GestureFusion:
         so you can switch now and the weights will be picked up automatically later.
         """
         from .static_yolo import YOLOStaticModel
+
         self._yolo = YOLOStaticModel(model_path, self.classes)
         self._yolo_path = model_path
-        self._static_backend = 'yolo'
+        self._static_backend = "yolo"
         self._yolo.ensure_loaded()  # attempts load now; warns if not trained yet
         print(f"[GestureFusion] static backend -> YOLO ({model_path})")
 
     def use_mobilenet_static(self):
         """Switch the static backend back to the HaGRID MobileNetV3 model."""
-        self._static_backend = 'mobilenet'
+        if self._model is None:
+            self._load_static_model()
+        self._static_backend = "mobilenet"
         print("[GestureFusion] static backend -> MobileNetV3 (HaGRID)")
 
     def use_combined_static(self):
         """Switch the static backend to a combined MobileNetV3 + YOLO ensemble."""
-        self._static_backend = 'combined'
+        self._static_backend = "combined"
+        if self._model is None:
+            self._load_static_model()
         # Ensure YOLO is loaded (lazy) so the ensemble has both branches.
         if self._yolo is None:
             try:
@@ -218,7 +265,6 @@ class GestureFusion:
             except Exception as e:
                 print(f"[GestureFusion] combined mode: YOLO not available: {e}")
         print("[GestureFusion] static backend -> Combined (MobileNetV3 + YOLO)")
-
 
     def load_static_model_by_id(self, model_id: str, model_config: dict):
         """
@@ -239,7 +285,9 @@ class GestureFusion:
                     print(f"[GestureFusion] Loaded YOLO model '{model_id}' from {path}")
                     return True
                 else:
-                    print(f"[GestureFusion] WARNING: YOLO path not found for '{model_id}': {path}")
+                    print(
+                        f"[GestureFusion] WARNING: YOLO path not found for '{model_id}': {path}"
+                    )
                     return False
             elif model_type == "combined":
                 self.use_combined_static()
@@ -249,11 +297,15 @@ class GestureFusion:
                 if path and os.path.exists(path):
                     self.ha_grid_model_path = path
                     self._load_static_model()
-                    self._static_backend = 'mobilenet'
-                    print(f"[GestureFusion] Loaded MobileNetV3 model '{model_id}' from {path}")
+                    self._static_backend = "mobilenet"
+                    print(
+                        f"[GestureFusion] Loaded MobileNetV3 model '{model_id}' from {path}"
+                    )
                     return True
                 else:
-                    print(f"[GestureFusion] WARNING: MobileNetV3 path not found for '{model_id}': {path}")
+                    print(
+                        f"[GestureFusion] WARNING: MobileNetV3 path not found for '{model_id}': {path}"
+                    )
                     return False
         print(f"[GestureFusion] WARNING: Model ID '{model_id}' not found in config")
         return False
@@ -277,7 +329,9 @@ class GestureFusion:
         return self._dynamic_model is not None
 
     # --------------------------- inference ---------------------------
-    def _crop_hand(self, frame: np.ndarray, landmarks, w: int, h: int) -> Optional[np.ndarray]:
+    def _crop_hand(
+        self, frame: np.ndarray, landmarks, w: int, h: int
+    ) -> Optional[np.ndarray]:
         xs = [int(lm.x * w) for lm in landmarks]
         ys = [int(lm.y * h) for lm in landmarks]
         x_min, x_max = max(0, min(xs)), min(w, max(xs))
@@ -301,6 +355,7 @@ class GestureFusion:
             return probs
         import torch
         from PIL import Image
+
         crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
         pil = Image.fromarray(crop_rgb)
         tensor = self._transform(pil).unsqueeze(0).to(self.device)
@@ -320,7 +375,7 @@ class GestureFusion:
 
     def _static_probs(self, frame, landmarks, w, h) -> np.ndarray:
         # Combined backend: average MobileNetV3 + YOLO probabilities
-        if self._static_backend == 'combined':
+        if self._static_backend == "combined":
             mn = self._mobilenet_probs(frame, landmarks, w, h)
             yl = self._yolo_probs(frame, landmarks, w, h)
             if yl is not None:
@@ -328,7 +383,7 @@ class GestureFusion:
             return mn
 
         # YOLO backend (switched at runtime)
-        if self._static_backend == 'yolo' and self._yolo is not None:
+        if self._static_backend == "yolo" and self._yolo is not None:
             crop = self._crop_hand(frame, landmarks, w, h)
             if crop is not None:
                 probs = self._yolo.predict_probs(crop)
@@ -342,14 +397,18 @@ class GestureFusion:
     def _mediapipe_probs(self, landmarks) -> np.ndarray:
         probs = np.zeros(len(self.classes), dtype=np.float32)
         name = self._mp_classifier.predict(landmarks)
-        idx = self._class_to_idx.get(name, self._class_to_idx['no_gesture'])
+        idx = self._class_to_idx.get(name, self._class_to_idx["no_gesture"])
         probs[idx] = 1.0
         return probs
 
-    def predict(self, frame: np.ndarray,
-                landmarks: Any,
-                w: int = None, h: int = None,
-                dynamic_sequence: Any = None) -> Tuple[str, float, Dict[str, float]]:
+    def predict(
+        self,
+        frame: np.ndarray,
+        landmarks: Any,
+        w: int = None,
+        h: int = None,
+        dynamic_sequence: Any = None,
+    ) -> Tuple[str, float, Dict[str, float]]:
         """
         Full fusion prediction.
 
@@ -369,7 +428,7 @@ class GestureFusion:
         # Dynamic branch takes priority when confident (dynamics > static)
         if self.has_dynamic and dynamic_sequence is not None:
             dyn_name, dyn_conf = self._dynamic_model.predict(dynamic_sequence)
-            if dyn_conf >= self.dynamic_threshold and dyn_name != 'no_gesture':
+            if dyn_conf >= self.dynamic_threshold and dyn_name != "no_gesture":
                 return dyn_name, float(dyn_conf), {dyn_name: float(dyn_conf)}
 
         # Static fusion: 0.8 * static_model + 0.2 * MediaPipe

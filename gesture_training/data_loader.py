@@ -4,16 +4,19 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
+from gesture_training.dynamic_model import JESTER_DYNAMIC_CLASSES
+
+
 class JesterDataLoader:
-    def __init__(self, data_dir: str = 'F:\jesterdata_sort\sorted'):
+    def __init__(self, data_dir: str = r"F:\jesterdata_sort\sorted"):
         self.data_dir = Path(data_dir)
-        self.class_map = {name: idx for idx, name in enumerate(GESTURE_CLASSES)}
+        self.class_map = {name: idx for idx, name in enumerate(JESTER_DYNAMIC_CLASSES)}
         self._load_csvs()
 
     def _load_csvs(self):
         # Process jester-v1-train.csv in chunks to avoid memory issues
         self.frames = []
-        for csv_file in self.data_dir.glob('jester-v1-*.csv'):
+        for csv_file in self.data_dir.glob("jester-v1-*.csv"):
             df = pd.read_csv(csv_file, chunksize=1000)
             for chunk in df:
                 # Extract 21st point (index 20) from landmarks
@@ -27,10 +30,13 @@ class JesterDataLoader:
 
     def get_batch(self, batch_size: int = 32):
         # Return batches of normalized 21-point landmarks
-        return np.array(self.frames)[np.random.permutation(len(self.frames))[:batch_size]]
+        return np.array(self.frames)[
+            np.random.permutation(len(self.frames))[:batch_size]
+        ]
+
 
 # Example usage
-if __name__ == '__main__':
+if __name__ == "__main__":
     loader = JesterDataLoader()
     batch = loader.get_batch()
-    print(f'Batch shape: {batch.shape}')  # Should be (batch_size, 24, 21)
+    print(f"Batch shape: {batch.shape}")  # Should be (batch_size, 24, 21)
