@@ -139,6 +139,8 @@ class GestureFusion:
         self._static_backend = 'mobilenet'   # 'mobilenet' | 'yolo' | 'combined'
         self._yolo = None                    # YOLOStaticModel instance
         self._yolo_path = None
+        self._dynamic_model = None
+        self._dynamic_classes: List[str] = []
 
         self._load_static_model()
 
@@ -152,6 +154,15 @@ class GestureFusion:
             return "cpu"
 
     def _load_static_model(self):
+        if not os.path.isfile(self.ha_grid_model_path):
+            print(
+                "[GestureFusion] static weights are not configured; "
+                "using the lightweight MediaPipe classifier"
+            )
+            self._model = None
+            self._transform = None
+            return
+
         try:
             import torch
             import torch.nn as nn
@@ -169,15 +180,15 @@ class GestureFusion:
             nn.Dropout(p=0.2, inplace=True),
             nn.Linear(1024, num_classes),
         )
-        if os.path.exists(self.ha_grid_model_path):
-            try:
-                state = torch.load(self.ha_grid_model_path, map_location=self.device)
-                model.load_state_dict(state)
-                print(f"[GestureFusion] HaGRID weights loaded: {self.ha_grid_model_path}")
-            except Exception as e:
-                print(f"[GestureFusion] failed to load weights: {e}")
-        else:
-            print(f"[GestureFusion] WARNING: weights not found at {self.ha_grid_model_path}")
+        try:
+            state = torch.load(self.ha_grid_model_path, map_location=self.device)
+            model.load_state_dict(state)
+            print(f"[GestureFusion] HaGRID weights loaded: {self.ha_grid_model_path}")
+        except Exception as e:
+            print(f"[GestureFusion] failed to load weights: {e}")
+            self._model = None
+            self._transform = None
+            return
         model = model.to(self.device)
         model.eval()
         self._model = model

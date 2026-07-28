@@ -15,11 +15,11 @@ import sys
 import numpy as np
 import pandas as pd
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT)
 
 from gesture_training.dynamic_model import (
-    DynamicLSTM, JESTER_DYNAMIC_CLASSES, SEQ_LEN, NUM_LM, LM_DIM,
+    DynamicLSTM, JESTER_DYNAMIC_CLASSES, SEQ_LEN,
 )
 
 # ---------------------------------------------------------------------------
@@ -34,7 +34,7 @@ CSV_MAPPINGS = {
     "test": r"F:\jesterdata_sort\jester-v1-test.csv",
 }
 LANDMARK_COUNT = 21
-FEATURES_PER_LM = 6  # x, y, z, dx, dy, dz
+FEATURES_PER_LM = 3  # x, y, z — must match DynamicLSTM's 21 * 3 input
 
 MODELS_DIR = os.path.join(ROOT, "gesture_training", "models")
 DYNAMIC_MODEL_PATH = os.path.join(MODELS_DIR, "dynamic_lstm.pth")
@@ -55,7 +55,7 @@ def _download_mediapipe_model():
 
 
 def _normalize_and_extract_features(landmarks_sequence):
-    """Center by wrist, scale by palm size, append delta velocities."""
+    """Center by wrist and scale by palm size."""
     seq_len = len(landmarks_sequence)
     final = np.zeros((seq_len, LANDMARK_COUNT, FEATURES_PER_LM), dtype=np.float32)
     for t in range(seq_len):
@@ -67,8 +67,6 @@ def _normalize_and_extract_features(landmarks_sequence):
             palm_size = 1.0
         normalized = centered / palm_size
         final[t, :, :3] = normalized
-        if t > 0:
-            final[t, :, 3:6] = final[t, :, :3] - final[t - 1, :, :3]
     return final.reshape(seq_len, -1)
 
 
@@ -156,6 +154,7 @@ def _load_npz(subset):
 
 def train_dynamic(epochs=20, batch_size=32):
     import torch
+    import torch.nn as nn
     from torch.utils.data import TensorDataset, DataLoader
 
     X, y, classes = _load_npz("train")
@@ -163,8 +162,11 @@ def train_dynamic(epochs=20, batch_size=32):
         print("No training .npz found. Run extract_jester() first.")
         return
     # Map jester labels -> dynamic vocabulary (best-effort)
-    label_map = {c: c for c in JESTER_DYNAMIC_CLASSES}
-    y_mapped = np.array([label_map.get(classes[i], 0) for i in y], dtype=np.int64)
+    label_map = {name: index for index, name in enumerate(JESTER_DYNAMIC_CLASSES)}
+    y_mapped = np.array(
+        [label_map.get(str(classes[int(index)]), 0) for index in y],
+        dtype=np.int64,
+    )
 
     Xt = torch.from_numpy(X).float()
     yt = torch.from_numpy(y_mapped).long()

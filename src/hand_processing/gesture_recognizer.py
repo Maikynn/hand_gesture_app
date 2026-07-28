@@ -169,7 +169,6 @@ class GestureRecognizer:
         # Thumb: compare tip x to IP joint x (accounting for handedness)
         # For simplicity, use distance from wrist
         thumb_tip = lm[THUMB_TIP]
-        thumb_ip = lm[THUMB_IP]
         thumb_mcp = lm[THUMB_MCP]
         # Thumb extended if tip is far from palm
         thumb_dist = np.linalg.norm([thumb_tip.x - thumb_mcp.x, thumb_tip.y - thumb_mcp.y])

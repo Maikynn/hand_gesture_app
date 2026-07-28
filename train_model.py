@@ -10,20 +10,9 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple
 
-# Gesture classes (40 gestures + unknown)
-GESTURE_CLASSES = [
-    "fist", "open_palm", "point", "victory", "thumbs_up",
-    "thumbs_down", "ok_sign", "rock", "peace", "call_me",
-    "stop", "come_here", "gun", "three", "four",
-    "five", "six", "seven", "eight", "nine",
-    "ten", "love", "horns", "shaka", "cross",
-    "pray", "wave", "pinch", "snap", "point_left",
-    "point_right", "point_up", "point_down", "fist_vertical", "open_vertical",
-    "c_hand", "l_hand", "y_hand", "w_hand", "x_hand",
-    "unknown"
-]
+from gesture_training.classes import GESTURE_CLASSES
 
 def create_model(input_shape: Tuple[int, int, int] = (150, 150, 3), 
                  num_classes: int = len(GESTURE_CLASSES)) -> keras.Model:
@@ -113,7 +102,7 @@ def train(data_dir: str, model_path: str = "models/built_in.tflite",
     
     # Train
     print("Training...")
-    history = model.fit(
+    model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
         epochs=epochs,

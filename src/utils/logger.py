@@ -4,7 +4,6 @@ Logging utilities for the Hand Gesture Application.
 """
 
 import logging
-import os
 from pathlib import Path
 
 def setup_logger(name: str, log_file: str = None, level: int = logging.INFO) -> logging.Logger:

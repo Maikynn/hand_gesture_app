@@ -2,7 +2,8 @@
 
 import tensorflow as tf
 from tensorflow.keras import layers, models
-from pathlib import Path
+
+from gesture_training.classes import GESTURE_CLASSES
 
 class MobileNetV3Static:
     def __init__(self, input_shape=(224, 224, 3)):
@@ -31,4 +32,4 @@ class MobileNetV3Static:
 # Example usage
 if __name__ == "__main__":
     static_model = MobileNetV3Static()
-    static_model.train("F:\MODELS\Model_learning")
+    static_model.train(r"F:\MODELS\Model_learning")

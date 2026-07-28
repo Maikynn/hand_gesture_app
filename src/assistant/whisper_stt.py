@@ -15,7 +15,6 @@ utterance once a silence gap is detected. The recognized text is delivered via
 ``on_final``; ``on_partial`` receives a short "listening" indicator while audio
 is being captured.
 """
-import os
 import struct
 import threading
 from typing import Callable, List, Optional, Tuple
@@ -40,8 +39,8 @@ except Exception:  # pragma: no cover
     _PYAUDIO_OK = False
 
 
-# Russian podcast/turbo model from HuggingFace (user-requested).
-DEFAULT_MODEL = "bond005/whisper-podlodka-turbo"
+# Small multilingual model: downloads on first selection and then runs offline.
+DEFAULT_MODEL = "tiny"
 
 
 def whisper_available() -> bool:
@@ -91,6 +90,7 @@ class WhisperStream:
                  on_final: Optional[Callable[[str], None]] = None,
                  device: str = "cpu",
                  compute_type: str = "int8",
+                 language: Optional[str] = "ru",
                  vad_threshold: float = 0.012,
                  silence_gap_sec: float = 0.6,
                  max_utterance_sec: float = 20.0):
@@ -107,6 +107,7 @@ class WhisperStream:
         self.on_final = on_final
         self.device = device
         self.compute_type = compute_type
+        self.language = language
         self.vad_threshold = vad_threshold
         self.silence_gap_sec = silence_gap_sec
         self.max_utterance_sec = max_utterance_sec
@@ -115,7 +116,7 @@ class WhisperStream:
         self.model = WhisperModel(
             model_path or model_name, device=device, compute_type=compute_type
         )
-        print(f"[WhisperSTT] model loaded")
+        print("[WhisperSTT] model loaded")
 
         self.pa = pyaudio.PyAudio()
         self.stream = None
@@ -179,7 +180,7 @@ class WhisperStream:
         self._speaking = False
         try:
             segments, _ = self.model.transcribe(
-                audio, language="ru", beam_size=5, vad_filter=True
+                audio, language=self.language, beam_size=5, vad_filter=True
             )
             text = " ".join(getattr(s, "text", "") for s in segments).strip()
         except Exception as e:

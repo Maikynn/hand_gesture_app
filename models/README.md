@@ -6,10 +6,16 @@ This directory contains gesture recognition models for the Hand Gesture Applicat
 - `built_in.tflite` or `built_in.onnx` - The default gesture recognition model
 - If not present, the app falls back to **rule-based gesture recognition** using MediaPipe hand landmarks
 
+## YOLO HaGRID
+- `yolo/hagrid_best.pt` — bundled 20-class YOLO gesture classifier
+- Select **YOLO HaGRID · нейросеть** on the Camera page
+- A different compatible `.pt` model can be selected with the file button
+- `setup_venv.bat` installs the CPU-only PyTorch/Ultralytics runtime
+
 ## Custom Models
 - Place custom models in the `custom/` subdirectory
 - Supported formats: `.tflite`, `.onnx`
-- Load via Settings → "Load Custom Model" button
+- Load from **Camera → Model → Custom ONNX/TFLite**
 
 ## Gesture Classes
 - `gesture_classes.txt` - List of 40 gesture names + "unknown" class

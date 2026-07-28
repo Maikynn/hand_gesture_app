@@ -12,7 +12,6 @@ import sys
 import json
 import time
 import threading
-from pathlib import Path
 from typing import List, Dict, Any
 
 # Add the hand_gesture_app directory to the path
@@ -201,7 +200,7 @@ def process_dynamics_file(filepath: str):
                 
                 print(f"[ProcessDynamics] Saved results to {results_file}")
             else:
-                print(f"[ProcessDynamics] Warning: Could not load model for prediction")
+                print("[ProcessDynamics] Warning: Could not load model for prediction")
         
     except Exception as e:
         print(f"[ProcessDynamics] Error processing file {filepath}: {e}")

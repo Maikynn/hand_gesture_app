@@ -7,7 +7,7 @@
     },
     "yolo_v8": {
       "name": "HaGRID YOLOv8",
-      "path": "F:/MODELS/Model_lerning/mobilenet_v3_static/weights",
+      "path": "models/yolo/hagrid_best.pt",
       "type": "yolo"
     },
     "combined": {

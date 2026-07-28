@@ -1,192 +1,158 @@
-# Hand Gesture Application
+# Axi Control
 
-A production-ready desktop application with a terminal-style interface featuring three windows: **Settings**, **Camera**, and **Assistant**.
+A Windows desktop app that combines two-hand gesture control with an embedded
+Jarvis voice assistant. The interface is split into four focused pages:
 
-## Features
+- **Camera** — fixed-size live preview, equal left/right hand cards and only
+  the essential camera, model, brightness, mirror and action controls.
+- **Assistant** — uncluttered text chat and microphone control.
+- **Camera Lab** — model files, visualization, ROI, training, profiles,
+  gesture bindings, sequences and recognition history.
+- **Jarvis Core** — voice, wake phrases, speech recognition, LLM, memory,
+  security, scenarios, permissions, commands and diagnostics.
 
-### 1. Settings Window
-- Camera device selection
-- Skeleton visualization toggles (face / hand / body)
-- Skeleton line thickness slider
-- Hand crop calibration padding slider
-- Custom model loading (`.tflite` or `.onnx`)
+The assistant runs inside the Python/PyQt process. It does not open a separate
+Jarvis window, Tauri app, Vite server, or background assistant executable.
 
-### 2. Camera Window
-- Live webcam feed with real-time skeleton overlay
-- MediaPipe Face Mesh, Hands, and Pose detection
-- 150×150 px hand-crop window (with configurable padding)
-- Real-time gesture recognition with gesture name + palm-side display
-- Rule-based recognition fallback (works without a trained model)
-- Optional trained model support (TFLite / ONNX) for higher accuracy
+## Quick start
 
-### 3. Assistant Window ("Axi")
-- Wake-word detection: **"аксиос"** (Russian for "axios")
-- Speech-to-text via Vosk (offline) or SpeechRecognition (online fallback)
-- OpenRouter API integration for AI responses (free tier supported)
-- Text-to-speech via pyttsx3 (offline)
-- Command execution: "открой" / "open", "запусти" / "run", "открой ссылку" / "open link"
-- Volume control, transcription log, response log
-- Text input for typed commands (works without microphone)
+Python 3.12 is required because the project pins the Windows-compatible
+MediaPipe 0.10.21 build.
 
-## Architecture
-
-| Component | Responsibility | Key Libraries |
-|-----------|----------------|---------------|
-| `VideoCapture` | Webcam acquisition with fallback | `opencv-python` |
-| `SkeletonRenderer` | Face/hand/body landmark drawing + raw landmark extraction | `mediapipe` |
-| `HandCropProcessor` | 150×150 hand crop extraction with padding | `numpy`, `cv2` |
-| `GestureRecognizer` | Rule-based + model-based gesture classification | MediaPipe landmarks / TFLite / ONNX |
-| `ModelManager` | Model loading (TFLite/ONNX), inference, switching | `tensorflow`, `onnxruntime` |
-| `SettingsWindow` | UI for camera, skeleton toggles, calibration | `PyQt5` |
-| `AssistantWindow` | Wake-word, OpenRouter, TTS, commands | `PyQt5`, `requests`, `pyttsx3` |
-| `WakeWordListener` | Offline speech recognition + wake-word | `vosk` / `speech_recognition` |
-| `OpenRouterClient` | Cloud LLM API communication | `requests` |
-| `TTSEngine` | Offline speech synthesis | `pyttsx3` |
-| `Logger` | File + console logging | `logging` |
-
-## Installation
-
-> **IMPORTANT — Python version requirement**
-> MediaPipe 0.10.35 on **Python 3.14** has **no working vision API** — both the
-> legacy `mp.solutions` and the new `mediapipe.tasks.vision` were removed/omitted
-> from that build, so hand/face/pose detection cannot run on 3.14.
-> This project therefore runs inside a **Python 3.12 virtual environment** that
-> uses `mediapipe==0.10.14` (the last release that still ships `mp.solutions`).
-
-### Option A — Automated (Windows)
-
-```bash
-cd hand_gesture_app
-setup_venv.bat      # creates the venv + installs mediapipe 0.10.14 and all deps
+```bat
+setup_venv.bat
+run.bat
 ```
 
-### Option B — Manual
+## Camera and gestures
 
-```bash
-# 1. Install Python 3.12 (if not present), e.g.:
-winget install Python.Python.3.12
+The camera page provides:
 
-# 2. Create and activate a venv
-cd hand_gesture_app
-py -3.12 -m venv venv
-venv\Scripts\activate.bat
+- an automatic hardware benchmark that selects ECO, BALANCED, or PERFORMANCE
+  quality and keeps adapting inference cadence to real FPS/latency;
+- one large camera view;
+- independent previews for the left and right hands;
+- labels such as `Левая: кулак` and `Правая: три`;
+- camera selection, brightness and mirroring on the live page;
+- crop, skeleton and advanced recognition settings on Camera Lab;
+- rule-based MediaPipe recognition by default;
+- optional built-in or user-selected ONNX/TFLite models;
+- bundled YOLO HaGRID model with a selectable `.pt` path;
+- stable-frame filtering and one action per held gesture;
+- a personal hand calibration wizard and in-app custom-gesture recording;
+- gesture sequences such as `fist → palm → two_up`;
+- Work, Games, Music, and Presentation control profiles;
+- configurable recognition ROI and automatic light/contrast/white balance;
+- an on-video HUD with FPS, confidence, latency, cooldown, model and device;
+- YOLO CUDA acceleration with automatic CPU fallback;
+- hold time and optional second-gesture confirmation against accidental actions;
+- a persistent history where wrong recognitions can be marked for retraining;
+- an optional compressed five-second error clip saved only after the user marks
+  a recognition as wrong;
+- a live confidence/latency telemetry graph and drag-and-drop sequence builder;
+- gesture zones (left, centre, right, top, bottom);
+- automatic control-profile switching by foreground application;
+- a landmark-only privacy view that never writes camera images;
+- an in-app lighting, sharpness, placement and framing wizard;
+- HTTP/HTTPS/RTSP phone-camera support;
+- safe mode: gesture actions stay off until explicitly enabled;
+- application, URL, hotkey, and safe built-in system actions.
 
-# 3. Install dependencies
-pip install "mediapipe==0.10.14" PyQt6 PyQt5 requests pyttsx3 onnxruntime SpeechRecognition
+Default bindings include play/pause on an open palm and volume control on
+thumb-up/thumb-down. Potentially disruptive bindings start disabled.
+
+## Embedded Jarvis
+
+The Assistant and Jarvis Core pages contain:
+
+- text chat and microphone control;
+- multiple wake phrases separated by commas;
+- offline Vosk, local Faster-Whisper, or online Google speech recognition;
+- editable command phrases with fuzzy matching;
+- a strict allowlist for executable files;
+- original Priler/Jarvis Russian reaction sounds;
+- local Silero TTS v5.5 Russian speech (`Eugene`) as the default high-quality
+  voice, with Piper (`Денис`) as a lighter offline alternative;
+- optional consent-gated XTTS v2 reference recording and personal voice engine;
+- optional Edge Neural and explicitly separate Windows SAPI speech;
+- no silent Microsoft SAPI substitution: the fallback is a visible user choice;
+- calm, strict, and emotional voice profiles plus sentence-level streaming TTS;
+- barge-in: microphone speech and Push-to-Talk interrupt current playback;
+- visible synthesis/playback/fallback/error status and repeat-safe voice tests;
+- automatic noise gating, lightweight echo reduction, microphone failover and
+  Russian/English auto mode;
+- OpenRouter, local Ollama, or any OpenAI-compatible API;
+- inspectable/deletable long-term memory and multi-step action scenarios;
+- local TXT/Markdown/DOCX/PDF search with an explicitly untrusted-context
+  boundary before excerpts reach the selected LLM;
+- local speaker verification for voice commands;
+- a simulation mode that previews commands without executing them;
+- an optional always-on-top mini HUD and adaptive reply prosody;
+- confirmation levels for important commands and `отмени последнее`;
+- system tray operation and a global `Ctrl+Alt+J` Push-to-Talk hotkey;
+- `Ctrl+1` through `Ctrl+4` navigation and wheel-safe parameter controls;
+- a diagnostics panel for microphone, STT, TTS, LLM and latency;
+- configurable humorous fallback phrases when no model is available.
+
+API keys are stored in Windows Credential Manager. Other choices are never
+written to tracked `config.json`; they live in the git-ignored
+`config.local.json`.
+
+Malformed model responses such as `ÐÑÐ¸Ð²ÐµÑ` are repaired at the provider
+boundary for both normal and streamed responses.
+
+## Configuration
+
+- `config.json` — versioned defaults.
+- `config.local.json` — all personal settings and API keys; created
+  automatically and ignored.
+- `config.local.example.json` — safe example file.
+
+To open an application, add its absolute `.exe` path to **Assistant → Access
+to applications**, then reference that same path in a voice command or gesture
+binding. Arbitrary shell commands are intentionally unsupported.
+
+## Structure
+
+```text
+src/
+  assistant/
+    actions.py           safe action executor
+    embedded_jarvis.py   command router and Priler voice reactions
+    listener.py          Vosk/Whisper/Google wake-word listener
+    llm_client.py        OpenRouter/Ollama/custom API routing
+  camera/                camera, MediaPipe and advanced gesture features
+  hand_processing/       gesture recognition and optional models
+  ui/
+    main_window.py       shell, camera page, gesture bindings
+    assistant_window.py  chat and assistant settings
+    theme.py             dark/light themes
+  utils/config_store.py  atomic public/local configuration
+third_party/priler_jarvis/
+  original source and voice/command resources
+models/vosk-ru/
+  offline Russian speech-recognition model
+models/piper/
+  downloaded lightweight local neural voice (ignored by Git)
+models/silero/
+  downloaded high-quality Russian Silero voice (ignored by Git)
+models/whisper/
+  downloaded Faster-Whisper model (ignored by Git)
 ```
 
-**Note for Windows:** `pyaudio` requires the PortAudio C library. If you need
-microphone wake-word detection, install a prebuilt wheel from
-https://www.lfd.uci.edu/~gohlke/pythonlibs/#pyaudio. Without it, the assistant's
-text-input mode still works (typing commands instead of speaking).
+## Tests
 
-## Running
-
-```bash
-# Full application (hand_gesture_app):
-run.bat                 # Windows — uses the venv automatically
-# or:
-venv\Scripts\activate.bat
-python src/main.py
-
-# Standalone gui_app.py (PyQt6 single-file app, in this folder):
-python gui_app.py       # auto-switches into the venv (mediapipe 0.10.14)
-# or use the launcher:
-run_gui_app.bat
+```bat
+venv\Scripts\python.exe -m unittest discover -s tests -v
+venv\Scripts\python.exe test_gesture_recognition.py
+venv\Scripts\python.exe -m ruff check src tests
 ```
 
-> `gui_app.py` contains a small bootstrap that automatically re-executes it inside
-> the Python 3.12 venv, so the plain command `python gui_app.py` works directly
-> (no manual venv activation needed). It is a lighter PyQt6 app whose
-> camera/skeleton tab works with this venv. The full three-window assistant with
-> wake-word + OpenRouter + TTS is `src/main.py` (hand_gesture_app).
+## License and attribution
 
-## Gesture Recognition
+This adapted distribution is provided under
+[CC BY-NC-SA 4.0](LICENSE). It is for non-commercial use and must retain
+attribution and ShareAlike terms.
 
-The app supports two recognition modes:
-
-1. **Rule-based (default, no model needed)**: Uses MediaPipe hand landmarks to classify common gestures:
-   - `fist`, `open_palm`, `point`, `victory`, `thumbs_up`, `thumbs_down`
-   - `ok_sign`, `rock`, `peace`, `call_me`, `gun`, `pinch`, `three`, `four`, `five`
-   - Plus 25+ additional gestures (see `models/gesture_classes.txt`)
-   - Palm-side classification (front/back) via landmark depth (z-coordinate)
-
-2. **Model-based (optional)**: Place a trained `built_in.tflite` or `built_in.onnx` in `models/`, or load a custom model via Settings. The model must output 41 classes matching `models/gesture_classes.txt`.
-
-### Training a Custom Model
-
-```bash
-python train_model.py --data_dir datasets --epochs 50
-```
-
-See `datasets/README.md` for data organization. The training script exports to `models/built_in.tflite`.
-
-## Project Structure
-
-```
-hand_gesture_app/
-├─ models/
-│   ├─ built_in.tflite          # optional trained model (TFLite)
-│   ├─ built_in.onnx            # optional trained model (ONNX)
-│   ├─ gesture_classes.txt      # 40 gesture names + "unknown"
-│   ├─ custom/                  # user-provided models
-│   └─ README.md
-├─ datasets/                    # training data (see datasets/README.md)
-├─ logs/                        # application logs
-├─ venv/                        # Python 3.12 virtual environment (created by setup_venv.bat)
-├─ src/
-│   ├─ main.py                  # entry point
-│   ├─ ui/
-│   │   ├─ main_window.py       # 3-window stacked UI
-│   │   ├─ settings_window.py   # settings UI + apply_settings signal
-│   │   └─ assistant_window.py  # assistant UI
-│   ├─ camera/
-│   │   ├─ video_capture.py     # OpenCV wrapper
-│   │   └─ skeleton_renderer.py # MediaPipe drawing + landmark extraction
-│   ├─ hand_processing/
-│   │   ├─ hand_crop.py         # hand crop extraction
-│   │   └─ gesture_recognizer.py# rule-based + model inference
-│   ├─ assistant/
-│   │   ├─ listener.py          # wake-word detection
-│   │   ├─ openrouter_client.py # OpenRouter API
-│   │   └─ tts_engine.py        # TTS engine
-│   └─ utils/
-│       ├─ logger.py            # logging setup
-│       └─ model_manager.py     # model loading/inference
-├─ gui_app.py                   # standalone PyQt6 app (auto-bootstraps into the venv)
-├─ train_model.py               # training script
-├─ test_gesture_recognition.py  # unit tests for recognizer
-├─ hand_gesture_app.spec        # PyInstaller spec
-├─ setup_venv.bat               # creates the Python 3.12 venv
-├─ run.bat                      # launches src/main.py in the venv
-├─ run_gui_app.bat              # launches gui_app.py in the venv
-├─ requirements.txt
-└─ README.md
-```
-
-## Testing
-
-```bash
-venv\Scripts\activate.bat
-python test_gesture_recognition.py
-```
-
-Verifies rule-based recognition for fist, open_palm, point, and victory gestures.
-
-## Packaging (Windows)
-
-```bash
-venv\Scripts\activate.bat
-pip install pyinstaller
-pyinstaller hand_gesture_app.spec
-```
-
-Output: `dist/HandGestureApp/HandGestureApp.exe`
-
-## Notes
-
-- All perception (hand/face/pose tracking) runs **offline** via MediaPipe.
-- Assistant works **offline** with Vosk + pyttsx3; OpenRouter requires internet + API key.
-- If no model is present, the app automatically uses rule-based recognition (no crash).
-- Logs are written to `logs/app.log` for debugging.
-- **Requires Python 3.12 (via the bundled `venv`)** — Python 3.14's MediaPipe build lacks the vision API needed for skeleton/gesture detection. `gui_app.py` auto-switches into the venv; for `src/main.py` use `run.bat` or activate the venv first.
+Priler/Jarvis attribution and the exact integration changes are documented in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

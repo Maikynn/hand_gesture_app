@@ -4,10 +4,15 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
+from gesture_training.dynamic_model import JESTER_DYNAMIC_CLASSES
+
+
 class JesterDataLoader:
-    def __init__(self, data_dir: str = 'F:\jesterdata_sort\sorted'):
+    def __init__(self, data_dir: str = r"F:\jesterdata_sort\sorted"):
         self.data_dir = Path(data_dir)
-        self.class_map = {name: idx for idx, name in enumerate(GESTURE_CLASSES)}
+        self.class_map = {
+            name: idx for idx, name in enumerate(JESTER_DYNAMIC_CLASSES)
+        }
         self._load_csvs()
 
     def _load_csvs(self):
