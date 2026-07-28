@@ -17,3 +17,5 @@ user_data/
 models/piper/
 models/whisper/
 models/silero/
+models/xtts_env/
+models/xtts_cache/

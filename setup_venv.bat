@@ -43,6 +43,13 @@ if not exist "models\whisper\tiny\model.bin" (
   if errorlevel 1 exit /b 1
 )
 
+for /f "delims=" %%M in ('"venv\Scripts\python.exe" -c "import sys; sys.path.insert(0, 'src'); from utils.hardware_profiler import detect_hardware; print(detect_hardware().whisper_model)"') do set "AXI_WHISPER_MODEL=%%M"
+if /i "%AXI_WHISPER_MODEL%"=="base" if not exist "models\whisper\base\model.bin" (
+  echo Powerful PC detected. Downloading the more accurate Faster-Whisper base model...
+  "venv\Scripts\hf.exe" download Systran/faster-whisper-base --local-dir "models\whisper\base"
+  if errorlevel 1 exit /b 1
+)
+
 if not exist "models\silero\v5_5_ru.pt" (
   echo Downloading the high-quality Russian Silero v5.5 voice...
   if not exist "models\silero" mkdir "models\silero"

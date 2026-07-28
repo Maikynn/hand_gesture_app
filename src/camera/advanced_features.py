@@ -17,6 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 USER_DATA_DIR = PROJECT_ROOT / "user_data"
 CUSTOM_GESTURES_PATH = USER_DATA_DIR / "custom_gestures.json"
 GESTURE_HISTORY_PATH = USER_DATA_DIR / "gesture_history.json"
+ERROR_CLIPS_DIR = USER_DATA_DIR / "error_clips"
 
 
 def normalized_landmarks(raw_hand: Any) -> Optional[np.ndarray]:
@@ -238,3 +239,98 @@ def apply_roi_mask(
     masked[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
     cv2.rectangle(masked, (x1, y1), (x2, y2), (73, 156, 255), 2)
     return masked, (x1, y1, x2, y2)
+
+
+HAND_EDGES = (
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17),
+)
+
+
+def privacy_silhouette(
+    shape: Sequence[int], hands: Iterable[Sequence[Tuple[int, int]]]
+) -> np.ndarray:
+    """Render only anonymous hand landmarks on a black HUD surface."""
+
+    height, width = int(shape[0]), int(shape[1])
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    for points_value in hands:
+        points = [(int(x), int(y)) for x, y in points_value]
+        for start, end in HAND_EDGES:
+            if start < len(points) and end < len(points):
+                cv2.line(canvas, points[start], points[end], (65, 226, 245), 2)
+        for point in points[:21]:
+            cv2.circle(canvas, point, 4, (190, 250, 255), -1)
+    cv2.putText(
+        canvas,
+        "PRIVACY MODE // LANDMARKS ONLY",
+        (18, height - 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (75, 210, 225),
+        1,
+        cv2.LINE_AA,
+    )
+    return canvas
+
+
+class ErrorClipRecorder:
+    """Keep a compressed rolling buffer and save it after user feedback."""
+
+    def __init__(self, directory: Path = ERROR_CLIPS_DIR, seconds: float = 5.0):
+        self.directory = directory
+        self.seconds = max(2.0, float(seconds))
+        self.frames: deque[Tuple[float, bytes]] = deque(maxlen=75)
+        self._last_capture = 0.0
+        self._lock = threading.RLock()
+
+    def push(self, rgb: np.ndarray, now: Optional[float] = None) -> None:
+        timestamp = time.monotonic() if now is None else float(now)
+        if timestamp - self._last_capture < 0.10:
+            return
+        self._last_capture = timestamp
+        small = cv2.resize(rgb, (640, 360), interpolation=cv2.INTER_AREA)
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            cv2.cvtColor(small, cv2.COLOR_RGB2BGR),
+            [cv2.IMWRITE_JPEG_QUALITY, 68],
+        )
+        if not ok:
+            return
+        with self._lock:
+            self.frames.append((timestamp, encoded.tobytes()))
+            cutoff = timestamp - self.seconds
+            while self.frames and self.frames[0][0] < cutoff:
+                self.frames.popleft()
+
+    def save_recent(self, label: str = "gesture_error") -> Optional[Path]:
+        with self._lock:
+            items = list(self.frames)
+        if not items:
+            return None
+        self.directory.mkdir(parents=True, exist_ok=True)
+        safe = "".join(
+            character
+            for character in label
+            if character.isalnum() or character in "_-"
+        )
+        path = self.directory / f"{safe or 'gesture_error'}_{int(time.time())}.mp4"
+        writer = cv2.VideoWriter(
+            str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (640, 360)
+        )
+        try:
+            if not writer.isOpened():
+                return None
+            for _timestamp, payload in items:
+                frame = cv2.imdecode(
+                    np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR
+                )
+                if frame is not None:
+                    writer.write(frame)
+        finally:
+            writer.release()
+        return path if path.is_file() and path.stat().st_size > 0 else None

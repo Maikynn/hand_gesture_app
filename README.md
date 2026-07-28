@@ -28,6 +28,8 @@ run.bat
 
 The camera page provides:
 
+- an automatic hardware benchmark that selects ECO, BALANCED, or PERFORMANCE
+  quality and keeps adapting inference cadence to real FPS/latency;
 - one large camera view;
 - independent previews for the left and right hands;
 - labels such as `Левая: кулак` and `Правая: три`;
@@ -45,6 +47,14 @@ The camera page provides:
 - YOLO CUDA acceleration with automatic CPU fallback;
 - hold time and optional second-gesture confirmation against accidental actions;
 - a persistent history where wrong recognitions can be marked for retraining;
+- an optional compressed five-second error clip saved only after the user marks
+  a recognition as wrong;
+- a live confidence/latency telemetry graph and drag-and-drop sequence builder;
+- gesture zones (left, centre, right, top, bottom);
+- automatic control-profile switching by foreground application;
+- a landmark-only privacy view that never writes camera images;
+- an in-app lighting, sharpness, placement and framing wizard;
+- HTTP/HTTPS/RTSP phone-camera support;
 - safe mode: gesture actions stay off until explicitly enabled;
 - application, URL, hotkey, and safe built-in system actions.
 
@@ -63,21 +73,33 @@ The Assistant and Jarvis Core pages contain:
 - original Priler/Jarvis Russian reaction sounds;
 - local Silero TTS v5.5 Russian speech (`Eugene`) as the default high-quality
   voice, with Piper (`Денис`) as a lighter offline alternative;
+- optional consent-gated XTTS v2 reference recording and personal voice engine;
 - optional Edge Neural and explicitly separate Windows SAPI speech;
 - no silent Microsoft SAPI substitution: the fallback is a visible user choice;
 - calm, strict, and emotional voice profiles plus sentence-level streaming TTS;
 - barge-in: microphone speech and Push-to-Talk interrupt current playback;
 - visible synthesis/playback/fallback/error status and repeat-safe voice tests;
+- automatic noise gating, lightweight echo reduction, microphone failover and
+  Russian/English auto mode;
 - OpenRouter, local Ollama, or any OpenAI-compatible API;
 - inspectable/deletable long-term memory and multi-step action scenarios;
+- local TXT/Markdown/DOCX/PDF search with an explicitly untrusted-context
+  boundary before excerpts reach the selected LLM;
+- local speaker verification for voice commands;
+- a simulation mode that previews commands without executing them;
+- an optional always-on-top mini HUD and adaptive reply prosody;
 - confirmation levels for important commands and `отмени последнее`;
 - system tray operation and a global `Ctrl+Alt+J` Push-to-Talk hotkey;
 - `Ctrl+1` through `Ctrl+4` navigation and wheel-safe parameter controls;
 - a diagnostics panel for microphone, STT, TTS, LLM and latency;
 - configurable humorous fallback phrases when no model is available.
 
-API keys and every choice made in the interface are never written to tracked
-`config.json`. They are stored only in the git-ignored `config.local.json`.
+API keys are stored in Windows Credential Manager. Other choices are never
+written to tracked `config.json`; they live in the git-ignored
+`config.local.json`.
+
+Malformed model responses such as `ÐÑÐ¸Ð²ÐµÑ` are repaired at the provider
+boundary for both normal and streamed responses.
 
 ## Configuration
 

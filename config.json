@@ -3,6 +3,12 @@
     "theme": "dark",
     "language": "ru"
   },
+  "hardware": {
+    "auto_tune": true,
+    "detected_tier": "auto",
+    "score": 0,
+    "last_tested": 0
+  },
   "camera": {
     "device_index": 0,
     "brightness": 0,
@@ -28,7 +34,16 @@
     "hold_ms": 450,
     "confirmation_gesture_enabled": false,
     "confirmation_gesture": "ok",
-    "calibration_scale": 1.0
+    "calibration_scale": 1.0,
+    "capture_width": 960,
+    "capture_height": 540,
+    "capture_fps": 30,
+    "network_url": "",
+    "use_network_camera": false,
+    "privacy_mode": false,
+    "record_error_clips": true,
+    "auto_profile_enabled": true,
+    "profile_app_rules": "powerpnt=presentation;spotify=music;steam=games;chrome=work"
   },
   "assistant": {
     "wake_phrases": "джарвис, аксиос",
@@ -67,7 +82,19 @@
       "Я бы с радостью ответил, но цифровые тараканы перегрызли провод к модели.",
       "Команду не узнал, а мозги ещё не подключены. Зато прозвучало уверенно!",
       "Сегодня я больше JAR, чем VIS. Проверь настройки провайдера."
-    ]
+    ],
+    "noise_suppression": true,
+    "echo_suppression": true,
+    "auto_microphone_switch": true,
+    "language_mode": "ru",
+    "speaker_auth_enabled": false,
+    "documents_enabled": false,
+    "documents_folder": "",
+    "overlay_enabled": false,
+    "dry_run_commands": false,
+    "adaptive_prosody": true,
+    "personal_voice_consent": false,
+    "local_llm_hint": "qwen3:4b"
   },
   "permissions": [
     {

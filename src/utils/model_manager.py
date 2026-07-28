@@ -26,7 +26,7 @@ class ModelManager:
     """
     Manages model loading, inference, and switching between local/cloud models.
     """
-    def __init__(self, model_dir: str = "models"):
+    def __init__(self, model_dir: str = "models", *, autoload: bool = True):
         """
         Initialize model manager with default model directory.
         """
@@ -36,12 +36,13 @@ class ModelManager:
         self.model_type = None  # 'tflite' or 'onnx'
         self.gesture_names = []
         
-        # Try to load built-in model (non-fatal if missing)
-        try:
-            self.load_built_in_model()
-        except Exception as e:
-            print(f"Warning: Could not load built-in model: {e}")
-            print("Application will use rule-based gesture recognition fallback.")
+        if autoload:
+            # Try to load built-in model (non-fatal if missing).
+            try:
+                self.load_built_in_model()
+            except Exception as e:
+                print(f"Warning: Could not load built-in model: {e}")
+                print("Application will use rule-based gesture recognition fallback.")
     
     def load_built_in_model(self) -> bool:
         """

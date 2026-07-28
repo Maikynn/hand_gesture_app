@@ -8,6 +8,7 @@ import ctypes
 import os
 import queue
 import re
+import subprocess
 import tempfile
 import threading
 import time
@@ -102,7 +103,7 @@ class TTSEngine:
     ):
         self.engine_name = (
             engine
-            if engine in {"silero", "piper", "edge", "system"}
+            if engine in {"silero", "piper", "xtts", "edge", "system"}
             else "edge"
         )
         self.voice_id = voice_id or (
@@ -111,7 +112,7 @@ class TTSEngine:
             else (
                 DEFAULT_PIPER_VOICE
                 if self.engine_name == "piper"
-                else DEFAULT_NEURAL_VOICE
+                else ("personal" if self.engine_name == "xtts" else DEFAULT_NEURAL_VOICE)
             )
         )
         self.rate = max(90, min(260, int(rate)))
@@ -171,6 +172,24 @@ class TTSEngine:
                     self._notify(
                         "fallback",
                         f"Silero недоступен — явно включён резерв Windows: {exc}",
+                    )
+            if request.engine == "xtts":
+                try:
+                    self._speak_xtts(request)
+                    self._notify("done", "Персональный XTTS воспроизведён локально")
+                    return
+                except SpeechCancelled:
+                    self._notify("cancelled", "Озвучка остановлена")
+                    return
+                except Exception as exc:
+                    if request.fallback_engine != "system":
+                        raise RuntimeError(
+                            f"XTTS недоступен: {exc}. "
+                            "Системный голос не подменял выбранный."
+                        ) from exc
+                    self._notify(
+                        "fallback",
+                        f"XTTS недоступен — явно включён резерв Windows: {exc}",
                     )
             if request.engine == "piper":
                 try:
@@ -268,6 +287,92 @@ class TTSEngine:
             raise SpeechCancelled
         self._notify("playing", f"Silero v5.5 · {speaker} · полностью офлайн")
         self._play_audio(samples, 48000, request.generation)
+
+    def _speak_xtts(self, request: SpeechRequest) -> None:
+        personal_dir = PROJECT_ROOT / "user_data" / "personal_voice"
+        reference = personal_dir / "reference.wav"
+        consent = personal_dir / "xtts_consent"
+        if not reference.is_file():
+            raise RuntimeError(
+                "референс не записан; используй студию персонального голоса"
+            )
+        if not consent.is_file():
+            raise RuntimeError(
+                "нет подтверждённого согласия с условиями XTTS и локальной обработкой"
+            )
+        environment_dir = PROJECT_ROOT / "models" / "xtts_env"
+        python_path = (
+            environment_dir / "Scripts" / "python.exe"
+            if os.name == "nt"
+            else environment_dir / "bin" / "python"
+        )
+        if not python_path.is_file():
+            raise RuntimeError(
+                "изолированный XTTS-компонент не установлен; нажми «Установить XTTS»"
+            )
+        worker = Path(__file__).with_name("xtts_worker.py")
+        text_handle, text_name = tempfile.mkstemp(prefix="axi-xtts-", suffix=".txt")
+        os.close(text_handle)
+        output_handle, output_name = tempfile.mkstemp(prefix="axi-xtts-", suffix=".wav")
+        os.close(output_handle)
+        text_path = Path(text_name)
+        output_path = Path(output_name)
+        output_path.unlink(missing_ok=True)
+        text_path.write_text(request.text, encoding="utf-8")
+        env = os.environ.copy()
+        env["TTS_HOME"] = str(PROJECT_ROOT / "models" / "xtts_cache")
+        # This variable is only set after the user explicitly accepts the
+        # displayed XTTS model terms and a local consent marker exists.
+        env["COQUI_TOS_AGREED"] = "1"
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        command = [
+            str(python_path),
+            str(worker),
+            "--text-file",
+            str(text_path),
+            "--reference",
+            str(reference),
+            "--output",
+            str(output_path),
+            "--language",
+            "ru",
+        ]
+        self._notify("loading", "XTTS v2 · синтез в изолированном процессе…")
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            creationflags=flags,
+        )
+        try:
+            started = time.monotonic()
+            while process.poll() is None:
+                if self._is_cancelled(request.generation):
+                    process.terminate()
+                    raise SpeechCancelled
+                if time.monotonic() - started > 900:
+                    process.terminate()
+                    raise RuntimeError("синтез XTTS превысил лимит 15 минут")
+                time.sleep(0.1)
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
+                details = (stderr or stdout or "неизвестная ошибка").strip()
+                raise RuntimeError(details[-500:])
+            if not output_path.is_file() or output_path.stat().st_size < 128:
+                raise RuntimeError("XTTS не создал звуковой файл")
+            if self._is_cancelled(request.generation):
+                raise SpeechCancelled
+            self._notify("playing", "XTTS v2 · персональный локальный голос")
+            self._play_wav(output_path, request.generation)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            text_path.unlink(missing_ok=True)
+            output_path.unlink(missing_ok=True)
 
     def _play_audio(
         self, audio: np.ndarray, sample_rate: int, generation: int
@@ -522,12 +627,13 @@ class TTSEngine:
     ) -> None:
         new_engine = (
             engine
-            if engine in {"silero", "piper", "edge", "system"}
+            if engine in {"silero", "piper", "xtts", "edge", "system"}
             else "edge"
         )
         default_voice = {
             "silero": DEFAULT_SILERO_VOICE,
             "piper": DEFAULT_PIPER_VOICE,
+            "xtts": "personal",
         }.get(new_engine, DEFAULT_NEURAL_VOICE)
         new_voice = voice_id or default_voice
         with self._state_lock:
@@ -562,7 +668,7 @@ class TTSEngine:
     def set_engine(self, engine: str) -> None:
         self.engine_name = (
             engine
-            if engine in {"silero", "piper", "edge", "system"}
+            if engine in {"silero", "piper", "xtts", "edge", "system"}
             else "edge"
         )
 

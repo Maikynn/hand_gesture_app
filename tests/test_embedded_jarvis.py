@@ -113,6 +113,23 @@ class EmbeddedJarvisTests(unittest.TestCase):
         self.assertEqual(result.kind, "wake")
         self.assertEqual(result.text, "Слушаю.")
 
+    def test_dry_run_previews_command_without_execution(self):
+        temp, store = self.make_store()
+        self.addCleanup(temp.cleanup)
+        store.set("assistant.dry_run_commands", True)
+        launched = []
+        core = EmbeddedJarvis(
+            store,
+            executor=ActionExecutor(
+                store.get("permissions"), app_launcher=launched.append
+            ),
+            llm=FakeLLM(answer="unused"),
+            voice_pack=FakeVoice(),
+        )
+        result = core.handle_text("открой питон")
+        self.assertEqual(result.kind, "preview")
+        self.assertEqual(launched, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -129,6 +129,33 @@ class TTSEngineTests(unittest.TestCase):
         offline.assert_not_called()
         self.assertTrue(any(state == "error" for state, _ in events))
 
+    @patch("threading.Thread.start")
+    def test_xtts_never_silently_becomes_windows_voice(self, _start):
+        events = []
+        tts = TTSEngine(
+            engine="xtts",
+            voice_id="personal",
+            fallback_engine="none",
+            on_event=lambda state, message: events.append((state, message)),
+        )
+        request = SpeechRequest(
+            text="Проверка",
+            generation=0,
+            engine="xtts",
+            voice_id="personal",
+            rate=175,
+            volume=0.9,
+            pitch=0,
+            fallback_engine="none",
+        )
+        with (
+            patch.object(tts, "_speak_xtts", side_effect=RuntimeError("missing")),
+            patch.object(tts, "_speak_offline") as offline,
+        ):
+            tts._speak(request)
+        offline.assert_not_called()
+        self.assertTrue(any(state == "error" for state, _ in events))
+
 
 if __name__ == "__main__":
     unittest.main()

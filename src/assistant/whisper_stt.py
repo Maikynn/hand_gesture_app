@@ -90,6 +90,7 @@ class WhisperStream:
                  on_final: Optional[Callable[[str], None]] = None,
                  device: str = "cpu",
                  compute_type: str = "int8",
+                 language: Optional[str] = "ru",
                  vad_threshold: float = 0.012,
                  silence_gap_sec: float = 0.6,
                  max_utterance_sec: float = 20.0):
@@ -106,6 +107,7 @@ class WhisperStream:
         self.on_final = on_final
         self.device = device
         self.compute_type = compute_type
+        self.language = language
         self.vad_threshold = vad_threshold
         self.silence_gap_sec = silence_gap_sec
         self.max_utterance_sec = max_utterance_sec
@@ -178,7 +180,7 @@ class WhisperStream:
         self._speaking = False
         try:
             segments, _ = self.model.transcribe(
-                audio, language="ru", beam_size=5, vad_filter=True
+                audio, language=self.language, beam_size=5, vad_filter=True
             )
             text = " ".join(getattr(s, "text", "") for s in segments).strip()
         except Exception as e:

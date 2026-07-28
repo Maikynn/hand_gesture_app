@@ -2,6 +2,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from assistant.listener import WakeWordListener
@@ -32,6 +34,14 @@ class WakeWordListenerTests(unittest.TestCase):
         self.listener.continuous_mode = True
         self.listener.process_recognized_text("обычный разговор")
         self.assertEqual(self.heard, ["обычный разговор"])
+
+    def test_noise_gate_attenuates_quiet_background(self):
+        listener = WakeWordListener(
+            noise_suppression=True, echo_suppression=False
+        )
+        quiet = np.full(4000, 20, dtype=np.int16)
+        processed = listener._process_audio(quiet)
+        self.assertLess(float(np.abs(processed).mean()), 10)
 
 
 if __name__ == "__main__":

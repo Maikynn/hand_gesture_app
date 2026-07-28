@@ -3,14 +3,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from assistant.actions import ActionExecutor
 from assistant.memory_store import MemoryStore
 from camera.advanced_features import (
     CustomGestureLibrary,
+    ErrorClipRecorder,
     GestureHistory,
     GestureSequenceMatcher,
+    privacy_silhouette,
 )
 
 
@@ -67,6 +71,27 @@ class AdvancedFeatureTests(unittest.TestCase):
             history.mark_incorrect(index)
             loaded = GestureHistory(history.path)
             self.assertTrue(loaded.items[0].incorrect)
+
+    def test_privacy_mode_renders_only_landmarks(self):
+        frame = privacy_silhouette(
+            (120, 160, 3), [[(20 + index * 3, 30 + index) for index in range(21)]]
+        )
+        self.assertEqual(frame.shape, (120, 160, 3))
+        self.assertGreater(int(frame.sum()), 0)
+        self.assertEqual(tuple(frame[0, 0]), (0, 0, 0))
+
+    def test_error_clip_uses_compressed_rolling_buffer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = ErrorClipRecorder(Path(directory), seconds=2)
+            frame = np.zeros((180, 320, 3), dtype=np.uint8)
+            for index in range(12):
+                frame[:, :, 0] = index * 10
+                recorder.push(frame, now=index * 0.11)
+            self.assertGreater(len(recorder.frames), 5)
+            self.assertLess(
+                sum(len(payload) for _, payload in recorder.frames),
+                frame.nbytes * len(recorder.frames),
+            )
 
     def test_memory_is_persistent_and_deletable(self):
         with tempfile.TemporaryDirectory() as directory:

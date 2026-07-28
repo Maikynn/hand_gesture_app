@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PyQt5.QtCore import QObject, Qt, pyqtSignal
+from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -34,6 +34,7 @@ from PyQt5.QtWidgets import (
 )
 
 from assistant.actions import ACTION_LABELS, ActionExecutor
+from assistant.document_index import DocumentIndex
 from assistant.embedded_jarvis import AssistantResult, EmbeddedJarvis
 from assistant.listener import WakeWordListener
 from assistant.tts_engine import (
@@ -43,6 +44,7 @@ from assistant.tts_engine import (
     TTSEngine,
     list_voices,
 )
+from assistant.voice_auth import VoiceAuthenticator
 from utils.config_store import ConfigStore
 
 
@@ -62,6 +64,40 @@ class AssistantSignals(QObject):
     tts_status = pyqtSignal(str, str)
     diagnostics_ready = pyqtSignal(str)
     stream_sentence = pyqtSignal(str)
+    background_result = pyqtSignal(str, str)
+
+
+class AssistantMiniHud(QWidget):
+    def __init__(self):
+        super().__init__(None)
+        self.setWindowFlags(
+            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(430, 92)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 13, 18, 13)
+        self.state = QLabel("● JARVIS // ONLINE")
+        self.state.setObjectName("CoreStatus")
+        self.message = QLabel("Ожидаю команду")
+        self.message.setWordWrap(True)
+        layout.addWidget(self.state)
+        layout.addWidget(self.message)
+        self.setStyleSheet(
+            """
+            QWidget { background: rgba(4, 17, 24, 228); border: 1px solid #39dff5;
+                      color: #d9fbff; font-family: 'Cascadia Mono'; }
+            QLabel { background: transparent; border: 0; }
+            """
+        )
+
+    def show_message(self, state: str, message: str) -> None:
+        self.state.setText(f"● JARVIS // {state.upper()}")
+        self.message.setText(str(message)[:180])
+        screen = self.screen().availableGeometry()
+        self.move(screen.right() - self.width() - 24, screen.bottom() - self.height() - 24)
+        if not self.isVisible():
+            self.show()
 
 
 class AssistantWindow(QWidget):
@@ -96,13 +132,22 @@ class AssistantWindow(QWidget):
             mic_index=self._mic_index(assistant.get("microphone_index", -1)),
             gain=float(assistant.get("microphone_gain", 1.0)),
             whisper_model=str(assistant.get("whisper_model", "tiny")),
+            noise_suppression=bool(assistant.get("noise_suppression", True)),
+            echo_suppression=bool(assistant.get("echo_suppression", True)),
+            language_mode=str(assistant.get("language_mode", "ru")),
         )
+        self.voice_authenticator = VoiceAuthenticator()
+        self.document_index = DocumentIndex(
+            str(assistant.get("documents_folder", ""))
+        )
+        self.mini_hud = AssistantMiniHud()
         self.signals.result_ready.connect(self._finish_result)
         self.signals.recognized.connect(self._handle_recognized)
         self.signals.listener_status.connect(self._listener_status)
         self.signals.tts_status.connect(self._tts_status)
         self.signals.diagnostics_ready.connect(self._show_diagnostics)
         self.signals.stream_sentence.connect(self._stream_sentence)
+        self.signals.background_result.connect(self._background_result)
         self._busy = False
         self._active_provider = str(assistant.get("llm_provider", "none"))
         self._draft_keys = {
@@ -117,6 +162,11 @@ class AssistantWindow(QWidget):
             "Готов к работе. Напиши команду или включи микрофон. "
             "Все действия с приложениями выполняются только из списка разрешений.",
         )
+        self.device_watch_timer = QTimer(self)
+        self.device_watch_timer.timeout.connect(self._auto_switch_microphone)
+        self.device_watch_timer.start(3500)
+        if bool(assistant.get("overlay_enabled", False)):
+            self.mini_hud.show_message("online", "Ожидаю команду")
 
     @staticmethod
     def _mic_index(value: Any) -> Optional[int]:
@@ -181,8 +231,9 @@ class AssistantWindow(QWidget):
         self.chat.document().setDefaultStyleSheet(
             """
             .row{margin:8px 0}.who{font-size:10px;color:#8390a8;margin-bottom:3px}
-            .user{background:#245fcb;color:white;padding:10px;border-radius:10px}
-            .assistant{background:#1b2943;color:#eef4ff;padding:10px;border-radius:10px}
+            .user{background:#0b7182;color:white;padding:10px;border-radius:4px}
+            .assistant{background:#0b202b;color:#dffcff;padding:10px;border-radius:4px;
+                       border-left:2px solid #39dff5}
             .meta{color:#8fa0bb;font-size:10px;margin-top:3px}
             """
         )
@@ -224,6 +275,7 @@ class AssistantWindow(QWidget):
         layout.addWidget(title)
         layout.addWidget(subtitle)
         layout.addWidget(self._voice_group())
+        layout.addWidget(self._intelligence_group())
         layout.addWidget(self._llm_group())
         layout.addWidget(self._safety_group())
         layout.addWidget(self._memory_group())
@@ -242,15 +294,17 @@ class AssistantWindow(QWidget):
         if (theme or "dark").lower() == "dark":
             css = """
             .row{margin:8px 0}.who{font-size:10px;color:#8390a8;margin-bottom:3px}
-            .user{background:#245fcb;color:white;padding:10px;border-radius:10px}
-            .assistant{background:#1b2943;color:#eef4ff;padding:10px;border-radius:10px}
+            .user{background:#0b7182;color:white;padding:10px;border-radius:4px}
+            .assistant{background:#0b202b;color:#dffcff;padding:10px;border-radius:4px;
+                       border-left:2px solid #39dff5}
             .meta{color:#8fa0bb;font-size:10px;margin-top:3px}
             """
         else:
             css = """
             .row{margin:8px 0}.who{font-size:10px;color:#64748b;margin-bottom:3px}
-            .user{background:#2864d7;color:white;padding:10px;border-radius:10px}
-            .assistant{background:#e9eff8;color:#172033;padding:10px;border-radius:10px}
+            .user{background:#087d8e;color:white;padding:10px;border-radius:4px}
+            .assistant{background:#e4f4f5;color:#12343b;padding:10px;border-radius:4px;
+                       border-left:2px solid #1593a4}
             .meta{color:#64748b;font-size:10px;margin-top:3px}
             """
         self.chat.document().setDefaultStyleSheet(css)
@@ -302,6 +356,7 @@ class AssistantWindow(QWidget):
         self.tts_engine = QComboBox()
         self.tts_engine.addItem("Silero v5.5 · лучший русский офлайн", "silero")
         self.tts_engine.addItem("Piper Neural · красивый офлайн-голос", "piper")
+        self.tts_engine.addItem("XTTS v2 · персональный голос", "xtts")
         self.tts_engine.addItem("Edge Neural · красивый онлайн-голос", "edge")
         self.tts_engine.addItem("Windows · системный офлайн-голос", "system")
         self.tts_engine.currentIndexChanged.connect(self._tts_engine_changed)
@@ -340,6 +395,103 @@ class AssistantWindow(QWidget):
         self.tts_volume = QSlider(Qt.Horizontal)
         self.tts_volume.setRange(0, 100)
         form.addRow("Громкость TTS", self.tts_volume)
+        return group
+
+    def _intelligence_group(self) -> QGroupBox:
+        group = QGroupBox("JARVIS Intelligence // звук, безопасность и локальные данные")
+        layout = QVBoxLayout(group)
+
+        audio = QHBoxLayout()
+        self.noise_suppression = QCheckBox("Шумоподавление")
+        self.echo_suppression = QCheckBox("Подавление эха")
+        self.auto_mic_switch = QCheckBox("Автопереключение микрофона")
+        self.language_mode = QComboBox()
+        self.language_mode.addItem("Только русский", "ru")
+        self.language_mode.addItem("Русский + English автоматически", "auto")
+        audio.addWidget(self.noise_suppression)
+        audio.addWidget(self.echo_suppression)
+        audio.addWidget(self.auto_mic_switch)
+        audio.addStretch(1)
+        audio.addWidget(self.language_mode)
+        layout.addLayout(audio)
+
+        security = QHBoxLayout()
+        self.speaker_auth = QCheckBox("Проверять владельца для голосовых команд")
+        enroll = QPushButton("Записать голос владельца")
+        enroll.setProperty("secondary", True)
+        enroll.clicked.connect(self._enroll_voice)
+        verify = QPushButton("Проверить голос")
+        verify.setProperty("secondary", True)
+        verify.clicked.connect(self._verify_voice)
+        self.speaker_status = QLabel(
+            "Профиль голоса записан"
+            if self.voice_authenticator.enrolled
+            else "Профиль голоса не записан"
+        )
+        self.speaker_status.setProperty("muted", True)
+        security.addWidget(self.speaker_auth)
+        security.addWidget(enroll)
+        security.addWidget(verify)
+        security.addWidget(self.speaker_status, 1)
+        layout.addLayout(security)
+
+        documents = QHBoxLayout()
+        self.documents_enabled = QCheckBox("Локальный поиск по документам")
+        self.documents_folder = QLineEdit()
+        self.documents_folder.setPlaceholderText("Папка с TXT, Markdown, DOCX и PDF")
+        choose_documents = QPushButton("Папка…")
+        choose_documents.setProperty("secondary", True)
+        choose_documents.clicked.connect(self._choose_documents_folder)
+        index_documents = QPushButton("Переиндексировать")
+        index_documents.setProperty("secondary", True)
+        index_documents.clicked.connect(self._reindex_documents)
+        self.documents_status = QLabel("Индекс не запускался")
+        self.documents_status.setProperty("muted", True)
+        documents.addWidget(self.documents_enabled)
+        documents.addWidget(self.documents_folder, 1)
+        documents.addWidget(choose_documents)
+        documents.addWidget(index_documents)
+        documents.addWidget(self.documents_status)
+        layout.addLayout(documents)
+
+        behavior = QHBoxLayout()
+        self.overlay_enabled = QCheckBox("Мини-HUD поверх программ")
+        self.overlay_enabled.toggled.connect(self._toggle_overlay)
+        self.dry_run_commands = QCheckBox("SIMULATION: не выполнять команды")
+        self.adaptive_prosody = QCheckBox("Автоинтонация ответа")
+        behavior.addWidget(self.overlay_enabled)
+        behavior.addWidget(self.dry_run_commands)
+        behavior.addWidget(self.adaptive_prosody)
+        behavior.addStretch(1)
+        layout.addLayout(behavior)
+
+        personal = QHBoxLayout()
+        self.personal_voice_consent = QCheckBox(
+            "Я согласен на локальную обработку записи и условия модели XTTS (CPML)"
+        )
+        self.personal_voice_consent.setToolTip(
+            "Референс остаётся на этом ПК. Модель XTTS v2 используется по Coqui Public "
+            "Model License: https://coqui.ai/cpml"
+        )
+        record_reference = QPushButton("Записать референс для XTTS")
+        record_reference.setProperty("secondary", True)
+        record_reference.clicked.connect(self._record_personal_voice)
+        install_xtts = QPushButton("Установить XTTS-компонент")
+        install_xtts.setProperty("secondary", True)
+        install_xtts.clicked.connect(self._install_xtts)
+        self.personal_voice_status = QLabel("XTTS загружается только по запросу")
+        self.personal_voice_status.setProperty("muted", True)
+        personal.addWidget(self.personal_voice_consent)
+        personal.addWidget(record_reference)
+        personal.addWidget(install_xtts)
+        personal.addWidget(self.personal_voice_status, 1)
+        layout.addLayout(personal)
+
+        vault = QLabel(
+            "API-ключи сохраняются в Windows Credential Manager, а не в config.local.json."
+        )
+        vault.setProperty("muted", True)
+        layout.addWidget(vault)
         return group
 
     def _llm_group(self) -> QGroupBox:
@@ -541,6 +693,39 @@ class AssistantWindow(QWidget):
         self.tts_rate.setValue(int(assistant.get("tts_rate", 175)))
         self.tts_pitch.setValue(int(assistant.get("tts_pitch", -12)))
         self.tts_volume.setValue(int(float(assistant.get("tts_volume", 0.9)) * 100))
+        self.noise_suppression.setChecked(
+            bool(assistant.get("noise_suppression", True))
+        )
+        self.echo_suppression.setChecked(
+            bool(assistant.get("echo_suppression", True))
+        )
+        self.auto_mic_switch.setChecked(
+            bool(assistant.get("auto_microphone_switch", True))
+        )
+        self._set_combo_data(
+            self.language_mode, assistant.get("language_mode", "ru")
+        )
+        self.speaker_auth.setChecked(
+            bool(assistant.get("speaker_auth_enabled", False))
+        )
+        self.documents_enabled.setChecked(
+            bool(assistant.get("documents_enabled", False))
+        )
+        self.documents_folder.setText(
+            str(assistant.get("documents_folder", ""))
+        )
+        self.overlay_enabled.setChecked(
+            bool(assistant.get("overlay_enabled", False))
+        )
+        self.dry_run_commands.setChecked(
+            bool(assistant.get("dry_run_commands", False))
+        )
+        self.adaptive_prosody.setChecked(
+            bool(assistant.get("adaptive_prosody", True))
+        )
+        self.personal_voice_consent.setChecked(
+            bool(assistant.get("personal_voice_consent", False))
+        )
         self._set_combo_data(
             self.confirmation_level,
             assistant.get("confirmation_level", "dangerous"),
@@ -577,6 +762,230 @@ class AssistantWindow(QWidget):
         index = self.microphone.findData(selected if selected is not None else -1)
         self.microphone.setCurrentIndex(max(0, index))
 
+    def _auto_switch_microphone(self) -> None:
+        if not hasattr(self, "auto_mic_switch") or not self.auto_mic_switch.isChecked():
+            return
+        selected = int(self.microphone.currentData() or -1)
+        if selected < 0:
+            return
+        available = {
+            int(item["index"]) for item in WakeWordListener.list_input_devices()
+        }
+        if selected in available:
+            return
+        was_listening = self.listener.is_listening
+        if was_listening:
+            self.listener.stop_listening()
+        self._refresh_microphones(-1)
+        self.listener.mic_index = None
+        self._set_status(
+            "warn", "Выбранный микрофон отключён — включён системный"
+        )
+        if was_listening:
+            self._toggle_listening(True)
+
+    def _choose_documents_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self, "Папка локальных документов", self.documents_folder.text()
+        )
+        if folder:
+            self.documents_folder.setText(folder)
+
+    def _reindex_documents(self) -> None:
+        folder = self.documents_folder.text().strip()
+        if not folder or not Path(folder).is_dir():
+            QMessageBox.warning(
+                self, "Локальные документы", "Выбери существующую папку."
+            )
+            return
+        self.documents_status.setText("Индексирую…")
+
+        def work() -> None:
+            self.document_index.set_root(folder)
+            count = self.document_index.rebuild()
+            self.signals.background_result.emit(
+                "documents", f"Готово: {count} фрагментов"
+            )
+
+        threading.Thread(target=work, name="document-index", daemon=True).start()
+
+    def _enroll_voice(self) -> None:
+        if self.listener.is_listening:
+            QMessageBox.information(
+                self, "Голос владельца", "Сначала останови микрофон помощника."
+            )
+            return
+        self.speaker_status.setText("Говори обычным голосом 3–4 секунды…")
+        mic = self._mic_index(self.microphone.currentData())
+
+        def work() -> None:
+            try:
+                samples = VoiceAuthenticator.capture(mic, 3.5)
+                self.voice_authenticator.enroll(samples)
+                self.listener.voice_auth.load()
+                message = "Профиль владельца записан"
+            except Exception as exc:
+                message = f"Ошибка записи: {exc}"
+            self.signals.background_result.emit("speaker_enroll", message)
+
+        threading.Thread(target=work, name="speaker-enroll", daemon=True).start()
+
+    def _verify_voice(self) -> None:
+        if not self.voice_authenticator.enrolled:
+            QMessageBox.information(
+                self, "Проверка голоса", "Сначала запиши голос владельца."
+            )
+            return
+        self.speaker_status.setText("Говори для проверки…")
+        mic = self._mic_index(self.microphone.currentData())
+
+        def work() -> None:
+            try:
+                samples = VoiceAuthenticator.capture(mic, 2.8)
+                score = self.voice_authenticator.score(samples)
+                message = f"Совпадение: {score:.0%}"
+            except Exception as exc:
+                message = f"Ошибка проверки: {exc}"
+            self.signals.background_result.emit("speaker_verify", message)
+
+        threading.Thread(target=work, name="speaker-verify", daemon=True).start()
+
+    def _record_personal_voice(self) -> None:
+        if not self.personal_voice_consent.isChecked():
+            QMessageBox.warning(
+                self,
+                "Персональный голос",
+                "Нужно явно подтвердить согласие на локальную обработку записи.",
+            )
+            return
+        if self.listener.is_listening:
+            QMessageBox.information(
+                self, "Персональный голос", "Сначала останови микрофон помощника."
+            )
+            return
+        self.personal_voice_status.setText(
+            "Читай любую фразу спокойно, запись длится 8 секунд…"
+        )
+        mic = self._mic_index(self.microphone.currentData())
+
+        def work() -> None:
+            try:
+                import wave
+
+                samples = VoiceAuthenticator.capture(mic, 8.0)
+                path = (
+                    Path(__file__).resolve().parents[2]
+                    / "user_data"
+                    / "personal_voice"
+                    / "reference.wav"
+                )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with wave.open(str(path), "wb") as output:
+                    output.setnchannels(1)
+                    output.setsampwidth(2)
+                    output.setframerate(16000)
+                    output.writeframes(samples.astype("<i2").tobytes())
+                (path.parent / "xtts_consent").write_text(
+                    "accepted: local-processing-and-coqui-cpml\n",
+                    encoding="utf-8",
+                )
+                message = "Референс сохранён локально · можно выбрать XTTS"
+            except Exception as exc:
+                message = f"Ошибка записи: {exc}"
+            self.signals.background_result.emit("personal_voice", message)
+
+        threading.Thread(target=work, name="personal-voice", daemon=True).start()
+
+    def _install_xtts(self) -> None:
+        if not self.personal_voice_consent.isChecked():
+            QMessageBox.warning(
+                self,
+                "XTTS",
+                "Подтверди согласие на локальное создание персонального голоса.",
+            )
+            return
+        self.personal_voice_status.setText("Устанавливаю XTTS-компонент…")
+
+        def work() -> None:
+            import subprocess
+            import sys
+
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            project_root = Path(__file__).resolve().parents[2]
+            environment_dir = project_root / "models" / "xtts_env"
+            python_path = environment_dir / "Scripts" / "python.exe"
+            commands = []
+            if not python_path.is_file():
+                commands.append(
+                    [sys.executable, "-m", "venv", str(environment_dir)]
+                )
+            commands.extend(
+                [
+                    [str(python_path), "-m", "pip", "install", "--upgrade", "pip"],
+                    [
+                        str(python_path),
+                        "-m",
+                        "pip",
+                        "install",
+                        "torch==2.8.0",
+                        "torchaudio==2.8.0",
+                        "--index-url",
+                        "https://download.pytorch.org/whl/cpu",
+                    ],
+                    [
+                        str(python_path),
+                        "-m",
+                        "pip",
+                        "install",
+                        "coqui-tts==0.27.5",
+                        "transformers>=4.57,<5",
+                    ],
+                ]
+            )
+            result = None
+            try:
+                for command in commands:
+                    result = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=1800,
+                        creationflags=flags,
+                        check=False,
+                    )
+                    if result.returncode != 0:
+                        break
+            except Exception as exc:
+                message = f"Ошибка установки XTTS: {exc}"
+            else:
+                message = (
+                    "XTTS установлен отдельно · MediaPipe не затронут"
+                    if result is not None and result.returncode == 0
+                    else "Не удалось установить XTTS; проверь соединение и повтори"
+                )
+            self.signals.background_result.emit("personal_voice", message)
+
+        threading.Thread(target=work, name="xtts-install", daemon=True).start()
+
+    def _toggle_overlay(self, enabled: bool) -> None:
+        if enabled:
+            self.mini_hud.show_message("online", self.status.text())
+        else:
+            self.mini_hud.hide()
+
+    def _background_result(self, target: str, message: str) -> None:
+        if target == "documents":
+            self.documents_status.setText(message)
+            self.core.documents.set_root(self.documents_folder.text().strip())
+            self.core.documents._load()
+        elif target.startswith("speaker"):
+            self.speaker_status.setText(message)
+        elif target == "personal_voice":
+            self.personal_voice_status.setText(message)
+        self._set_status("good" if "Ошибка" not in message else "bad", message)
+
     def _tts_engine_changed(self, *_args) -> None:
         engine = str(self.tts_engine.currentData())
         selected = self.tts_voice.currentData()
@@ -584,6 +993,8 @@ class AssistantWindow(QWidget):
             choices = SILERO_VOICES
         elif engine == "piper":
             choices = PIPER_VOICES
+        elif engine == "xtts":
+            choices = [("personal", "Мой локальный голос · XTTS v2")]
         elif engine == "edge":
             choices = NEURAL_VOICES
         else:
@@ -603,6 +1014,7 @@ class AssistantWindow(QWidget):
         tooltips = {
             "silero": "Silero v5.5: русский, ударения, омографы и вопросы. Полностью локально.",
             "piper": "Настоящий локальный нейронный голос. Интернет после установки не нужен.",
+            "xtts": "Клонирование по твоему референсу. Требует явного согласия и мощного ПК.",
             "edge": "Онлайн Neural. При сбое Windows включится только если это разрешено ниже.",
             "system": "Обычный установленный голос Windows.",
         }
@@ -766,6 +1178,16 @@ class AssistantWindow(QWidget):
             started = time.perf_counter()
             lines = []
             project_root = Path(__file__).resolve().parents[2]
+            try:
+                from utils.hardware_profiler import detect_hardware
+
+                hardware = detect_hardware()
+                lines.append(
+                    f"✅ ПК: {hardware.tier_label}, score {hardware.score}/100, "
+                    f"{hardware.logical_cores} потоков, {hardware.ram_gb:.1f} ГБ RAM"
+                )
+            except Exception as exc:
+                lines.append(f"⚠ Тест ПК: {exc}")
             microphones = WakeWordListener.list_input_devices()
             lines.append(
                 f"✅ Микрофоны: {len(microphones)}"
@@ -786,11 +1208,18 @@ class AssistantWindow(QWidget):
             try:
                 import faster_whisper  # noqa: F401
 
-                whisper_model = project_root / "models/whisper/tiny/model.bin"
+                selected_whisper = str(self.whisper_model.currentData() or "tiny")
+                whisper_model = (
+                    project_root
+                    / "models"
+                    / "whisper"
+                    / selected_whisper
+                    / "model.bin"
+                )
                 lines.append(
-                    "✅ Whisper: движок и локальная модель установлены"
+                    f"✅ Whisper {selected_whisper}: локальная модель установлена"
                     if whisper_model.is_file()
-                    else "⚠ Whisper: движок есть, модель загрузит setup_venv.bat"
+                    else f"⚠ Whisper {selected_whisper}: модель не установлена"
                 )
             except Exception as exc:
                 lines.append(f"❌ Whisper: {exc}")
@@ -1001,6 +1430,17 @@ class AssistantWindow(QWidget):
             "assistant.confirmation_level": str(self.confirmation_level.currentData()),
             "assistant.close_to_tray": self.close_to_tray.isChecked(),
             "assistant.push_to_talk_hotkey": self.push_to_talk_hotkey.text().strip(),
+            "assistant.noise_suppression": self.noise_suppression.isChecked(),
+            "assistant.echo_suppression": self.echo_suppression.isChecked(),
+            "assistant.auto_microphone_switch": self.auto_mic_switch.isChecked(),
+            "assistant.language_mode": str(self.language_mode.currentData()),
+            "assistant.speaker_auth_enabled": self.speaker_auth.isChecked(),
+            "assistant.documents_enabled": self.documents_enabled.isChecked(),
+            "assistant.documents_folder": self.documents_folder.text().strip(),
+            "assistant.overlay_enabled": self.overlay_enabled.isChecked(),
+            "assistant.dry_run_commands": self.dry_run_commands.isChecked(),
+            "assistant.adaptive_prosody": self.adaptive_prosody.isChecked(),
+            "assistant.personal_voice_consent": self.personal_voice_consent.isChecked(),
         }
         if provider == "openrouter":
             values["assistant.openrouter_model"] = self.model.text().strip()
@@ -1010,9 +1450,11 @@ class AssistantWindow(QWidget):
         elif provider == "custom":
             values["assistant.custom_api_url"] = self.endpoint.text().strip()
             values["assistant.custom_model"] = self.model.text().strip()
-        for key_provider in ("openrouter", "custom"):
-            values[f"assistant.api_keys.{key_provider}"] = self._draft_keys.get(key_provider, "")
         self.store.update_many(values)
+        for key_provider in ("openrouter", "custom"):
+            self.store.set_api_key(
+                key_provider, self._draft_keys.get(key_provider, "")
+            )
         self.store.replace_section("permissions", permissions)
         self.store.replace_section("commands", commands)
         self.store.replace_section("scenarios", scenarios)
@@ -1026,6 +1468,9 @@ class AssistantWindow(QWidget):
             mic_index=self._mic_index(self.microphone.currentData()),
             gain=self.mic_gain.value(),
             whisper_model=str(self.whisper_model.currentData()),
+            noise_suppression=self.noise_suppression.isChecked(),
+            echo_suppression=self.echo_suppression.isChecked(),
+            language_mode=str(self.language_mode.currentData()),
         )
         self.tts.configure(
             engine=str(self.tts_engine.currentData()),
@@ -1070,7 +1515,26 @@ class AssistantWindow(QWidget):
             meta = f"действие заблокировано: {result.error}"
         elif result.kind == "streamed":
             meta = "потоковый ответ · озвучка началась по предложениям"
+        elif result.kind == "preview":
+            meta = "SIMULATION · действие не выполнялось"
         self._append_message("assistant", result.text, meta)
+        if self.overlay_enabled.isChecked():
+            self.mini_hud.show_message(result.kind, result.text)
+        if self.adaptive_prosody.isChecked():
+            profile = (
+                "strict"
+                if result.kind in {"error", "confirmation"}
+                else ("emotional" if result.kind in {"fallback", "preview"} else "calm")
+            )
+            self.tts.configure(
+                engine=str(self.tts_engine.currentData()),
+                voice_id=str(self.tts_voice.currentData()),
+                rate={"strict": 165, "emotional": 194}.get(profile, 175),
+                volume=self.tts_volume.value() / 100.0,
+                pitch={"strict": -18, "emotional": 3}.get(profile, -10),
+                fallback_engine=str(self.tts_fallback.currentData()),
+                profile=profile,
+            )
         if self.tts_enabled.isChecked() and result.kind in {
             "answer",
             "fallback",
@@ -1078,6 +1542,7 @@ class AssistantWindow(QWidget):
             "command",
             "confirmation",
             "cancelled",
+            "preview",
         }:
             self.tts.speak_stream(result.text)
         self._busy = False
@@ -1119,6 +1584,21 @@ class AssistantWindow(QWidget):
 
     def _handle_recognized(self, text: str) -> None:
         self.tts.stop()
+        if self.speaker_auth.isChecked():
+            score = self.listener.last_speaker_score
+            if not self.voice_authenticator.enrolled:
+                self._set_status(
+                    "bad", "Проверка владельца включена, но голос не записан"
+                )
+                return
+            if score is None or score < 0.78:
+                self._append_message(
+                    "assistant",
+                    "Голос не подтверждён. Команда заблокирована.",
+                    f"speaker score {0 if score is None else score:.0%}",
+                )
+                self._set_status("bad", "Голос владельца не подтверждён")
+                return
         self._append_message("user", text, "голос")
         if not self._busy:
             self._process(text)
@@ -1145,6 +1625,8 @@ class AssistantWindow(QWidget):
         self.status.style().unpolish(self.status)
         self.status.style().polish(self.status)
         self.status_changed.emit(level, text)
+        if hasattr(self, "overlay_enabled") and self.overlay_enabled.isChecked():
+            self.mini_hud.show_message(level, text)
 
     def apply_settings(self, _settings: Dict[str, Any]) -> None:
         self.core.reload()
@@ -1158,3 +1640,4 @@ class AssistantWindow(QWidget):
     def cleanup(self) -> None:
         self.listener.stop_listening()
         self.tts.shutdown()
+        self.mini_hud.close()

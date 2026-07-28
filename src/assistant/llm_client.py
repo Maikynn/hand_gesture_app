@@ -12,6 +12,31 @@ class LLMError(RuntimeError):
     pass
 
 
+_MOJIBAKE_MARKERS = ("Ð", "Ñ", "Ã", "Â", "â€", "ðŸ")
+
+
+def repair_mojibake(value: Any) -> str:
+    """Repair UTF-8 text that was accidentally decoded as Latin-1/CP1252."""
+
+    text = str(value or "")
+    for _ in range(2):
+        if not any(marker in text for marker in _MOJIBAKE_MARKERS):
+            break
+        try:
+            candidate = text.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            try:
+                candidate = text.encode("cp1252").decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                break
+        old_artifacts = sum(text.count(marker) for marker in _MOJIBAKE_MARKERS)
+        new_artifacts = sum(candidate.count(marker) for marker in _MOJIBAKE_MARKERS)
+        if new_artifacts >= old_artifacts:
+            break
+        text = candidate
+    return text
+
+
 @dataclass
 class LLMSettings:
     provider: str = "none"
@@ -127,6 +152,7 @@ class LLMClient:
             raise LLMError(f"Нет связи с API: {exc}") from exc
         if response.status_code != 200:
             raise LLMError(f"API вернуло HTTP {response.status_code}")
+        response.encoding = "utf-8"
         full = ""
         buffer = ""
         try:
@@ -145,14 +171,21 @@ class LLMClient:
                 except (ValueError, TypeError, IndexError):
                     continue
                 full += token
-                buffer += token
+                buffer = repair_mojibake(buffer + token)
                 buffer = self._emit_sentences(buffer, on_sentence)
         finally:
             response.close()
         self._emit_sentences(buffer, on_sentence, flush=True)
         if not full.strip():
+            # Some OpenAI-compatible gateways accept ``stream=true`` but send
+            # no SSE content for router/auto models. Retry once without
+            # streaming instead of turning a valid provider into a fallback.
+            fallback = self._post_openai(endpoint, model, messages, api_key)
+            if fallback:
+                on_sentence(fallback)
+                return fallback
             raise LLMError("API вернуло пустой поток")
-        return full.strip()
+        return repair_mojibake(full).strip()
 
     def _stream_ollama(
         self, message: str, prompt: str, on_sentence: Callable[[str], None]
@@ -173,6 +206,7 @@ class LLMClient:
             raise LLMError(f"Ollama не отвечает: {exc}") from exc
         if response.status_code != 200:
             raise LLMError(f"Ollama вернула HTTP {response.status_code}")
+        response.encoding = "utf-8"
         full = ""
         buffer = ""
         try:
@@ -185,14 +219,18 @@ class LLMClient:
                 except (ValueError, TypeError):
                     continue
                 full += token
-                buffer += token
+                buffer = repair_mojibake(buffer + token)
                 buffer = self._emit_sentences(buffer, on_sentence)
         finally:
             response.close()
         self._emit_sentences(buffer, on_sentence, flush=True)
-        full = re.sub(r"<think>.*?</think>", "", full, flags=re.S).strip()
+        full = repair_mojibake(
+            re.sub(r"<think>.*?</think>", "", full, flags=re.S)
+        ).strip()
         if not full:
-            raise LLMError("Локальная модель не вернула поток")
+            fallback = self._ollama(message, prompt)
+            on_sentence(fallback)
+            return fallback
         return full
 
     def _messages(self, message: str, prompt: str) -> List[Dict[str, str]]:
@@ -259,7 +297,7 @@ class LLMClient:
             raise LLMError("API вернуло неожиданный формат ответа") from exc
         if not str(content).strip():
             raise LLMError("API вернуло пустой ответ")
-        return str(content).strip()
+        return repair_mojibake(content).strip()
 
     def _ollama(self, message: str, prompt: str) -> str:
         endpoint = (self.settings.endpoint or "http://127.0.0.1:11434").rstrip("/")
@@ -280,7 +318,9 @@ class LLMClient:
             content = str(response.json().get("message", {}).get("content", ""))
         except ValueError as exc:
             raise LLMError("Ollama вернула некорректный JSON") from exc
-        content = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
+        content = repair_mojibake(
+            re.sub(r"<think>.*?</think>", "", content, flags=re.S)
+        ).strip()
         if not content:
             raise LLMError("Локальная модель не вернула ответ")
         return content

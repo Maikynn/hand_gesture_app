@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from assistant.actions import ActionError, ActionExecutor
+from assistant.document_index import DocumentIndex
 from assistant.llm_client import LLMClient, LLMError, LLMSettings
 from assistant.memory_store import MemoryStore
 from utils.config_store import ConfigStore, PROJECT_ROOT
@@ -81,6 +82,7 @@ class EmbeddedJarvis:
         self.llm = llm or LLMClient()
         self.voice_pack = voice_pack or PrilerVoicePack()
         self.memory = MemoryStore()
+        self.documents = DocumentIndex()
         self.commands: List[Dict[str, Any]] = []
         self.error_phrases: List[str] = []
         self.threshold = 66.0
@@ -110,8 +112,8 @@ class EmbeddedJarvis:
         self.confirmation_level = str(
             assistant.get("confirmation_level", "none")
         ).lower()
+        self.documents.set_root(str(assistant.get("documents_folder", "")))
         provider = str(assistant.get("llm_provider", "none"))
-        api_keys = assistant.get("api_keys", {}) or {}
         endpoint = ""
         model = ""
         if provider == "openrouter":
@@ -127,7 +129,7 @@ class EmbeddedJarvis:
                 provider=provider,
                 endpoint=endpoint,
                 model=model,
-                api_key=str(api_keys.get(provider, "") or ""),
+                api_key=self.store.api_key(provider),
                 system_prompt=str(assistant.get("system_prompt", "")),
                 max_tokens=int(assistant.get("max_tokens", 350)),
                 fallback_models=[
@@ -249,9 +251,7 @@ class EmbeddedJarvis:
                 )
             return self._execute_command(command, score)
         try:
-            base_prompt = str(self.llm.settings.system_prompt or "")
-            memory = self.memory.prompt_context()
-            prompt = "\n\n".join(value for value in (base_prompt, memory) if value)
+            prompt = self._prompt_for(clean)
             try:
                 answer = self.llm.send_message(clean, system_prompt=prompt)
             except TypeError:
@@ -279,6 +279,19 @@ class EmbeddedJarvis:
     def _execute_command(
         self, command: Dict[str, Any], score: float
     ) -> AssistantResult:
+        if (
+            bool(self.store.get("assistant.dry_run_commands", False))
+            and str(command.get("type", "")) != "response"
+        ):
+            description = command.get("reply") or (
+                f"{command.get('type', '')}: {command.get('target', '')}"
+            )
+            return AssistantResult(
+                f"SIMULATION // Я бы выполнил: {description}. Действие не запускалось.",
+                "preview",
+                command_id=str(command.get("id", "")),
+                score=score,
+            )
         try:
             response = self.executor.execute(command)
             response = str(command.get("reply") or response)
@@ -329,15 +342,32 @@ class EmbeddedJarvis:
         )
         if special or not clean or self.find_command(clean) or not self.llm.is_configured():
             return self.handle_text(text)
-        base_prompt = str(self.llm.settings.system_prompt or "")
-        memory = self.memory.prompt_context()
-        prompt = "\n\n".join(value for value in (base_prompt, memory) if value)
+        prompt = self._prompt_for(clean)
         try:
             answer = self.llm.send_message_stream(clean, on_sentence, prompt)
             return AssistantResult(answer, "streamed")
         except LLMError as exc:
             self.voice_pack.play("not_found")
             return AssistantResult(self._funny_error(), "fallback", error=str(exc))
+
+    def _prompt_for(self, query: str) -> str:
+        assistant = self.store.get("assistant", {}) or {}
+        base_prompt = str(self.llm.settings.system_prompt or "")
+        memory = self.memory.prompt_context()
+        documents = ""
+        if bool(assistant.get("documents_enabled", False)):
+            documents = self.documents.prompt_context(query)
+        language_mode = str(assistant.get("language_mode", "ru"))
+        if language_mode == "auto":
+            cyrillic = bool(re.search(r"[А-Яа-яЁё]", query))
+            latin = bool(re.search(r"[A-Za-z]", query))
+            language = "Russian" if cyrillic or not latin else "English"
+            language_rule = f"Reply in {language}, matching the user's language."
+        else:
+            language_rule = "Всегда отвечай на русском языке."
+        return "\n\n".join(
+            value for value in (base_prompt, language_rule, memory, documents) if value
+        )
 
     def _funny_error(self) -> str:
         if self.error_phrases:

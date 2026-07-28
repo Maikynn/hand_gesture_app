@@ -3,6 +3,7 @@ from __future__ import annotations
 import signal
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -35,6 +36,7 @@ from PyQt5.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -56,11 +58,13 @@ from PyQt5.QtWidgets import (
 from assistant.actions import ACTION_LABELS, ActionExecutor
 from camera.advanced_features import (
     CustomGestureLibrary,
+    ErrorClipRecorder,
     GestureHistory,
     GestureSequenceMatcher,
     apply_roi_mask,
     auto_enhance,
     normalized_landmarks,
+    privacy_silhouette,
 )
 from camera.video_capture import VideoCapture
 from hand_processing.gesture_recognizer import GestureRecognizer
@@ -68,8 +72,14 @@ from hand_processing.gesture_fusion import HAGRID_CLASSES
 from hand_processing.static_yolo import DEFAULT_YOLO_MODEL, YOLOStaticModel
 from ui.assistant_window import AssistantWindow
 from ui.theme import apply_theme
+from utils.active_window import foreground_process_name, match_profile, parse_profile_rules
 from utils.config_store import ConfigStore
 from utils.global_hotkey import GlobalHotkey
+from utils.hardware_profiler import (
+    AdaptiveLoadController,
+    HardwareProfile,
+    detect_hardware,
+)
 from utils.logger import setup_logger
 from utils.model_manager import ModelManager
 
@@ -189,6 +199,52 @@ class JarvisOrb(QWidget):
         painter.drawText(self.rect(), Qt.AlignCenter, "AI")
 
 
+class ConfidenceGraph(QWidget):
+    """Compact live graph for confidence and inference latency."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(130)
+        self.setObjectName("TelemetryGraph")
+        self.confidence: deque[float] = deque([0.0] * 60, maxlen=60)
+        self.latency: deque[float] = deque([0.0] * 60, maxlen=60)
+
+    def add_sample(self, confidence: float, latency_ms: float) -> None:
+        self.confidence.append(max(0.0, min(1.0, float(confidence))))
+        self.latency.append(max(0.0, min(1.0, float(latency_ms) / 300.0)))
+        if self.isVisible():
+            self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#030b10"))
+        width, height = self.width(), self.height()
+        painter.setPen(QPen(QColor("#143942"), 1))
+        for fraction in (0.25, 0.5, 0.75):
+            y = round(height * fraction)
+            painter.drawLine(0, y, width, y)
+
+        def draw(values, color):
+            points = list(values)
+            if len(points) < 2:
+                return
+            painter.setPen(QPen(QColor(color), 2))
+            for index in range(1, len(points)):
+                x1 = round((index - 1) * (width - 1) / (len(points) - 1))
+                x2 = round(index * (width - 1) / (len(points) - 1))
+                y1 = round((1.0 - points[index - 1]) * (height - 18)) + 5
+                y2 = round((1.0 - points[index]) * (height - 18)) + 5
+                painter.drawLine(x1, y1, x2, y2)
+
+        draw(self.latency, "#ffb454")
+        draw(self.confidence, "#52e7f7")
+        painter.setPen(QColor("#77aab3"))
+        painter.drawText(10, height - 5, "CONFIDENCE")
+        painter.setPen(QColor("#ffb454"))
+        painter.drawText(width - 95, height - 5, "LATENCY")
+
+
 class HandPreview(QFrame):
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
@@ -217,6 +273,14 @@ class HandPreview(QFrame):
             f"<span style='font-size:9pt;color:#8f9bb3'>{confidence:.0%}</span>"
         )
         CameraWidget.set_image(self.image, crop, allow_upscale=False)
+
+    def update_private(self, title: str, gesture: str, confidence: float) -> None:
+        self.image.clear()
+        self.image.setText("COORDS ONLY")
+        self.text.setText(
+            f"{title}: {GESTURE_LABELS.get(gesture, gesture)}\n"
+            f"<span style='font-size:9pt;color:#78cbd5'>{confidence:.0%}</span>"
+        )
 
 
 class GestureBindingsPanel(QFrame):
@@ -256,9 +320,9 @@ class GestureBindingsPanel(QFrame):
         hint.setProperty("muted", True)
         hint.setWordWrap(True)
         layout.addWidget(hint)
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Вкл.", "Жест", "Действие", "Значение", "Точность", "Пауза, мс"]
+            ["Вкл.", "Жест", "Зона", "Действие", "Значение", "Точность", "Пауза, мс"]
         )
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -300,15 +364,26 @@ class GestureBindingsPanel(QFrame):
         self.table.setItem(row, 0, enabled)
         gesture_map = {name: GESTURE_LABELS.get(name, name) for name in GESTURES}
         self.table.setCellWidget(row, 1, self._combo(gesture_map, str(binding.get("gesture", "palm"))))
+        zone_map = {
+            "any": "Любая",
+            "left": "Слева",
+            "center": "Центр",
+            "right": "Справа",
+            "top": "Сверху",
+            "bottom": "Снизу",
+        }
+        self.table.setCellWidget(
+            row, 2, self._combo(zone_map, str(binding.get("zone", "any")))
+        )
         action_map = {
             key: label
             for key, label in ACTION_LABELS.items()
             if key in {"application", "url", "hotkey", "system"}
         }
-        self.table.setCellWidget(row, 2, self._combo(action_map, str(binding.get("type", "system"))))
-        self.table.setItem(row, 3, QTableWidgetItem(str(binding.get("target", ""))))
-        self.table.setItem(row, 4, QTableWidgetItem(str(binding.get("confidence", 0.8))))
-        self.table.setItem(row, 5, QTableWidgetItem(str(binding.get("cooldown_ms", 1200))))
+        self.table.setCellWidget(row, 3, self._combo(action_map, str(binding.get("type", "system"))))
+        self.table.setItem(row, 4, QTableWidgetItem(str(binding.get("target", ""))))
+        self.table.setItem(row, 5, QTableWidgetItem(str(binding.get("confidence", 0.8))))
+        self.table.setItem(row, 6, QTableWidgetItem(str(binding.get("cooldown_ms", 1200))))
         self.table.selectRow(row)
 
     def remove_selected(self) -> None:
@@ -320,28 +395,34 @@ class GestureBindingsPanel(QFrame):
         row = self.table.currentRow()
         if row < 0:
             return
-        kind = self.table.cellWidget(row, 2)
+        kind = self.table.cellWidget(row, 3)
         if not isinstance(kind, QComboBox) or kind.currentData() != "application":
             QMessageBox.information(self, "Тип действия", "Сначала выбери тип «Приложение».")
             return
         path, _ = QFileDialog.getOpenFileName(self, "Выберите приложение", "", "Программы (*.exe)")
         if path:
-            self.table.item(row, 3).setText(path)
+            self.table.item(row, 4).setText(path)
 
     def values(self) -> List[Dict[str, Any]]:
         result = []
         for row in range(self.table.rowCount()):
             gesture = self.table.cellWidget(row, 1)
-            kind = self.table.cellWidget(row, 2)
-            assert isinstance(gesture, QComboBox) and isinstance(kind, QComboBox)
+            zone = self.table.cellWidget(row, 2)
+            kind = self.table.cellWidget(row, 3)
+            assert (
+                isinstance(gesture, QComboBox)
+                and isinstance(zone, QComboBox)
+                and isinstance(kind, QComboBox)
+            )
             result.append(
                 {
                     "enabled": self.table.item(row, 0).checkState() == Qt.Checked,
                     "gesture": str(gesture.currentData()),
+                    "zone": str(zone.currentData()),
                     "type": str(kind.currentData()),
-                    "target": self.table.item(row, 3).text().strip(),
-                    "confidence": float(self.table.item(row, 4).text().replace(",", ".")),
-                    "cooldown_ms": int(self.table.item(row, 5).text()),
+                    "target": self.table.item(row, 4).text().strip(),
+                    "confidence": float(self.table.item(row, 5).text().replace(",", ".")),
+                    "cooldown_ms": int(self.table.item(row, 6).text()),
                 }
             )
         return result
@@ -361,16 +442,40 @@ class GestureBindingsPanel(QFrame):
 
 class CameraWidget(QWidget):
     status_changed = pyqtSignal(str, str)
+    hardware_ready = pyqtSignal(object)
 
     def __init__(self, store: ConfigStore | None = None, parent=None):
         super().__init__(parent)
         self.store = store or ConfigStore()
         self.logger = setup_logger("CameraWidget")
+        self.hardware_profile: HardwareProfile = detect_hardware()
+        if bool(self.store.get("hardware.auto_tune", True)):
+            self._apply_hardware_profile(self.hardware_profile, announce=False)
         self.settings = self.store.get("camera", {}) or {}
         self.camera_id = int(self.settings.get("device_index", 0))
-        self.video_capture = VideoCapture(self.camera_id)
+        camera_source: int | str = self.camera_id
+        if bool(self.settings.get("use_network_camera", False)):
+            network_url = str(self.settings.get("network_url", "")).strip()
+            if network_url:
+                camera_source = network_url
+        self.video_capture = VideoCapture(
+            camera_source,
+            width=int(
+                self.settings.get(
+                    "capture_width", self.hardware_profile.camera_width
+                )
+            ),
+            height=int(
+                self.settings.get(
+                    "capture_height", self.hardware_profile.camera_height
+                )
+            ),
+            fps=int(
+                self.settings.get("capture_fps", self.hardware_profile.camera_fps)
+            ),
+        )
         self.renderer = SkeletonRenderer()
-        self.model_manager = ModelManager()
+        self.model_manager = ModelManager(autoload=False)
         self.recognizer = GestureRecognizer(self.model_manager)
         self.yolo_model: Optional[YOLOStaticModel] = None
         self._model_loading = False
@@ -381,9 +486,19 @@ class CameraWidget(QWidget):
             if custom_name not in GESTURES:
                 GESTURES.append(custom_name)
         self.history = GestureHistory()
+        self.error_clips = ErrorClipRecorder()
+        self._last_pixel_hands: List[List[Tuple[int, int]]] = []
+        self._hand_zones = {"Left": "any", "Right": "any"}
+        self._lighting_samples: Optional[List[Tuple[float, float, int]]] = None
+        self._clip_saving = False
         self.sequence_matcher = GestureSequenceMatcher(
             self.store.get("gesture_sequences", [])
         )
+        self.load_controller = AdaptiveLoadController(
+            int(self.settings.get("inference_interval_ms", 100)),
+            self.hardware_profile.tier,
+        )
+        self._adaptive_interval_ms = self.load_controller.current_interval_ms
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.process_frame)
         self._last_inference = 0.0
@@ -419,9 +534,38 @@ class CameraWidget(QWidget):
         self._recording_samples: List[List[float]] = []
         self._calibration_samples: Optional[List[float]] = None
         self._build_ui()
+        self.hardware_ready.connect(self._hardware_retested)
         self.store.changed.connect(self._store_changed)
+        self.profile_watch_timer = QTimer(self)
+        self.profile_watch_timer.timeout.connect(self._auto_switch_profile)
+        self.profile_watch_timer.start(1800)
         if self.model_combo.currentData() == "yolo":
             QTimer.singleShot(0, self._change_model)
+
+    def _apply_hardware_profile(
+        self, profile: HardwareProfile, *, announce: bool = True
+    ) -> None:
+        self.store.update_many(
+            {
+                "hardware.detected_tier": profile.tier,
+                "hardware.score": profile.score,
+                "hardware.last_tested": profile.measured_at,
+                "camera.capture_width": profile.camera_width,
+                "camera.capture_height": profile.camera_height,
+                "camera.capture_fps": profile.camera_fps,
+                "camera.inference_interval_ms": profile.inference_interval_ms,
+                "camera.yolo_inference_interval_ms": profile.yolo_interval_ms,
+                "camera.model": profile.camera_model,
+                "assistant.whisper_model": profile.whisper_model,
+                "assistant.local_llm_hint": profile.local_llm_hint,
+                "assistant.ollama_model": profile.local_llm_hint,
+            }
+        )
+        if announce and hasattr(self, "hardware_report"):
+            self.hardware_report.setText(profile.summary())
+            self._set_camera_status(
+                "good", f"Применён профиль {profile.tier_label}"
+            )
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -583,16 +727,43 @@ class CameraWidget(QWidget):
         self.padding.setValue(int(self.settings.get("crop_padding", 34)))
         self.padding.valueChanged.connect(self._save_camera_controls)
         form.addRow("Отступ руки", self.padding)
+        network_row = QHBoxLayout()
+        self.network_camera_url = QLineEdit(
+            str(self.settings.get("network_url", ""))
+        )
+        self.network_camera_url.setPlaceholderText(
+            "http://192.168.1.20:8080/video или rtsp://..."
+        )
+        connect_network = QPushButton("Подключить")
+        connect_network.setProperty("secondary", True)
+        connect_network.clicked.connect(self._connect_network_camera)
+        network_row.addWidget(self.network_camera_url, 1)
+        network_row.addWidget(connect_network)
+        form.addRow("Камера телефона", network_row)
         row.addLayout(form, 2)
 
         toggles = QVBoxLayout()
         self.show_hands = QCheckBox("Рисовать скелет рук")
         self.show_face = QCheckBox("Сетка лица")
         self.show_pose = QCheckBox("Скелет тела")
+        self.privacy_mode_check = QCheckBox("Privacy: только координаты рук")
+        self.error_clips_check = QCheckBox("Сохранять ролик после отметки ошибки")
         self.show_hands.setChecked(bool(self.settings.get("show_hands", True)))
         self.show_face.setChecked(bool(self.settings.get("show_face", False)))
         self.show_pose.setChecked(bool(self.settings.get("show_pose", False)))
-        for widget in (self.show_hands, self.show_face, self.show_pose):
+        self.privacy_mode_check.setChecked(
+            bool(self.settings.get("privacy_mode", False))
+        )
+        self.error_clips_check.setChecked(
+            bool(self.settings.get("record_error_clips", True))
+        )
+        for widget in (
+            self.show_hands,
+            self.show_face,
+            self.show_pose,
+            self.privacy_mode_check,
+            self.error_clips_check,
+        ):
             widget.toggled.connect(self._save_camera_controls)
             toggles.addWidget(widget)
         row.addLayout(toggles, 1)
@@ -608,6 +779,7 @@ class CameraWidget(QWidget):
         title = QLabel("Точная настройка и обучение")
         title.setStyleSheet("font-size: 13pt; font-weight: 700;")
         layout.addWidget(title)
+        layout.addWidget(self._hardware_group())
 
         columns = QHBoxLayout()
         form = QFormLayout()
@@ -649,17 +821,22 @@ class CameraWidget(QWidget):
         self.hud_check = QCheckBox("Подробный HUD поверх видео")
         self.roi_check = QCheckBox("Распознавать только внутри ROI")
         self.confirm_gesture_check = QCheckBox("Подтверждать действие вторым жестом")
+        self.auto_profile_check = QCheckBox("Автопрофиль по активной программе")
         self.auto_enhance_check.setChecked(bool(self.settings.get("auto_enhance", False)))
         self.hud_check.setChecked(bool(self.settings.get("hud_enabled", True)))
         self.roi_check.setChecked(bool(self.settings.get("roi_enabled", False)))
         self.confirm_gesture_check.setChecked(
             bool(self.settings.get("confirmation_gesture_enabled", False))
         )
+        self.auto_profile_check.setChecked(
+            bool(self.settings.get("auto_profile_enabled", True))
+        )
         for option in (
             self.auto_enhance_check,
             self.hud_check,
             self.roi_check,
             self.confirm_gesture_check,
+            self.auto_profile_check,
         ):
             option.toggled.connect(self._save_advanced_controls)
             options.addWidget(option)
@@ -676,6 +853,19 @@ class CameraWidget(QWidget):
             self._save_advanced_controls
         )
         options.addWidget(self.confirm_gesture_combo)
+        self.profile_rules = QLineEdit(
+            str(
+                self.settings.get(
+                    "profile_app_rules",
+                    "powerpnt=presentation;spotify=music;steam=games;chrome=work",
+                )
+            )
+        )
+        self.profile_rules.setToolTip(
+            "Формат: часть_имени.exe=профиль; следующая=профиль"
+        )
+        self.profile_rules.editingFinished.connect(self._save_advanced_controls)
+        options.addWidget(self.profile_rules)
         columns.addLayout(options, 2)
 
         roi_form = QFormLayout()
@@ -695,19 +885,39 @@ class CameraWidget(QWidget):
         calibrate = QPushButton("Калибровать руки")
         calibrate.setProperty("secondary", True)
         calibrate.clicked.connect(self._start_calibration)
+        lighting = QPushButton("Мастер камеры и света")
+        lighting.setProperty("secondary", True)
+        lighting.clicked.connect(self._start_lighting_wizard)
         record = QPushButton("Записать свой жест")
         record.setProperty("secondary", True)
         record.clicked.connect(self._start_custom_recording)
-        self.sequence_steps = QLineEdit()
-        self.sequence_steps.setPlaceholderText("fist > palm > two_up")
+        self.sequence_gesture = QComboBox()
+        for gesture in GESTURES:
+            self.sequence_gesture.addItem(
+                GESTURE_LABELS.get(gesture, gesture), gesture
+            )
+        add_step = QPushButton("+ Шаг")
+        add_step.setProperty("secondary", True)
+        add_step.clicked.connect(self._add_sequence_step)
+        remove_step = QPushButton("− Шаг")
+        remove_step.setProperty("secondary", True)
+        remove_step.clicked.connect(self._remove_sequence_step)
+        self.sequence_builder = QListWidget()
+        self.sequence_builder.setFlow(QListWidget.LeftToRight)
+        self.sequence_builder.setDragDropMode(QAbstractItemView.InternalMove)
+        self.sequence_builder.setMaximumHeight(54)
         add_sequence = QPushButton("+ Последовательность")
         add_sequence.setProperty("secondary", True)
         add_sequence.clicked.connect(self._add_sequence)
         tools.addWidget(calibrate)
+        tools.addWidget(lighting)
         tools.addWidget(record)
-        tools.addWidget(self.sequence_steps, 1)
+        tools.addWidget(self.sequence_gesture)
+        tools.addWidget(add_step)
+        tools.addWidget(remove_step)
         tools.addWidget(add_sequence)
         layout.addLayout(tools)
+        layout.addWidget(self.sequence_builder)
         self.sequences_table = QTableWidget(0, 3)
         self.sequences_table.setHorizontalHeaderLabels(
             ["Последовательность", "Действие", "Пауза"]
@@ -723,8 +933,41 @@ class CameraWidget(QWidget):
         sequence_buttons.addWidget(remove_sequence)
         sequence_buttons.addStretch(1)
         layout.addLayout(sequence_buttons)
+        self.confidence_graph = ConfidenceGraph()
+        layout.addWidget(self.confidence_graph)
         self._refresh_sequences()
         return card
+
+    def _hardware_group(self) -> QGroupBox:
+        group = QGroupBox("AUTO PERFORMANCE // тест конфигурации ПК")
+        layout = QHBoxLayout(group)
+        self.hardware_report = QLabel(self.hardware_profile.summary())
+        self.hardware_report.setWordWrap(True)
+        self.hardware_report.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.hardware_report, 1)
+        controls = QVBoxLayout()
+        self.auto_tune_check = QCheckBox("Автоматически подстраивать качество и нагрузку")
+        self.auto_tune_check.setChecked(
+            bool(self.store.get("hardware.auto_tune", True))
+        )
+        self.auto_tune_check.toggled.connect(
+            lambda value: self.store.set("hardware.auto_tune", value)
+        )
+        retest = QPushButton("Повторить тест железа")
+        retest.setProperty("secondary", True)
+        retest.clicked.connect(self._retest_hardware)
+        apply_profile = QPushButton("Применить рекомендуемый профиль")
+        apply_profile.clicked.connect(self._activate_hardware_profile)
+        controls.addWidget(self.auto_tune_check)
+        controls.addWidget(retest)
+        controls.addWidget(apply_profile)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+        return group
+
+    def _activate_hardware_profile(self) -> None:
+        self.auto_tune_check.setChecked(True)
+        self._hardware_retested(self.hardware_profile)
 
     def _history_panel(self) -> QGroupBox:
         group = QGroupBox("История распознавания и исправления")
@@ -756,6 +999,68 @@ class CameraWidget(QWidget):
         index = combo.findData(value)
         combo.setCurrentIndex(max(0, index))
 
+    def _retest_hardware(self) -> None:
+        self._set_camera_status("warn", "Тестирую CPU, RAM, GPU и видеопрофиль…")
+
+        def work() -> None:
+            self.hardware_ready.emit(detect_hardware(force=True))
+
+        import threading
+
+        threading.Thread(target=work, name="hardware-profiler", daemon=True).start()
+
+    def _hardware_retested(self, profile: HardwareProfile) -> None:
+        self.hardware_profile = profile
+        self.hardware_report.setText(profile.summary())
+        if self.auto_tune_check.isChecked():
+            self._apply_hardware_profile(profile)
+            self.video_capture.configure(
+                profile.camera_width, profile.camera_height, profile.camera_fps
+            )
+            self.load_controller = AdaptiveLoadController(
+                profile.inference_interval_ms, profile.tier
+            )
+            self._adaptive_interval_ms = profile.inference_interval_ms
+            model_index = self.model_combo.findData(profile.camera_model)
+            if model_index >= 0:
+                self.model_combo.setCurrentIndex(model_index)
+        else:
+            self._set_camera_status(
+                "good", f"Тест завершён: {profile.tier_label}"
+            )
+
+    def _auto_switch_profile(self) -> None:
+        if not hasattr(self, "auto_profile_check") or not self.auto_profile_check.isChecked():
+            return
+        profile_id = match_profile(
+            foreground_process_name(), parse_profile_rules(self.profile_rules.text())
+        )
+        if not profile_id or profile_id == self.profile_combo.currentData():
+            return
+        index = self.profile_combo.findData(profile_id)
+        if index >= 0:
+            self.profile_combo.setCurrentIndex(index)
+
+    def _add_sequence_step(self) -> None:
+        gesture = str(self.sequence_gesture.currentData())
+        self.sequence_builder.addItem(
+            f"{GESTURE_LABELS.get(gesture, gesture)} [{gesture}]"
+        )
+
+    def _remove_sequence_step(self) -> None:
+        row = self.sequence_builder.currentRow()
+        if row < 0:
+            row = self.sequence_builder.count() - 1
+        if row >= 0:
+            self.sequence_builder.takeItem(row)
+
+    def _start_lighting_wizard(self) -> None:
+        self._lighting_samples = []
+        self._set_camera_status(
+            "warn",
+            "Мастер камеры: сядь как обычно и покажи открытую ладонь 4 секунды",
+        )
+
     def _save_advanced_controls(self, *_args) -> None:
         if not hasattr(self, "roi_sliders"):
             return
@@ -782,6 +1087,8 @@ class CameraWidget(QWidget):
                 "camera.confirmation_gesture": str(
                     self.confirm_gesture_combo.currentData()
                 ),
+                "camera.auto_profile_enabled": self.auto_profile_check.isChecked(),
+                "camera.profile_app_rules": self.profile_rules.text().strip(),
             }
         )
         if reload_yolo:
@@ -802,6 +1109,11 @@ class CameraWidget(QWidget):
                 self.bindings_panel.load_bindings(profile["bindings"])
         if "hold_ms" in profile:
             self.hold_ms.setValue(int(profile["hold_ms"]))
+        if "inference_interval_ms" in profile:
+            self.load_controller = AdaptiveLoadController(
+                int(profile["inference_interval_ms"]), self.hardware_profile.tier
+            )
+            self._adaptive_interval_ms = self.load_controller.current_interval_ms
         self._set_camera_status("good", f"Профиль «{self.profile_combo.currentText()}» применён")
 
     def _save_profile(self) -> None:
@@ -845,14 +1157,16 @@ class CameraWidget(QWidget):
         )
 
     def _add_sequence(self) -> None:
-        steps = [
-            value.strip().lower()
-            for value in self.sequence_steps.text().replace("→", ">").split(">")
-            if value.strip()
-        ]
+        steps = []
+        for index in range(self.sequence_builder.count()):
+            text = self.sequence_builder.item(index).text()
+            if "[" in text and text.endswith("]"):
+                steps.append(text.rsplit("[", 1)[1][:-1].strip().lower())
         if len(steps) < 2:
             QMessageBox.warning(
-                self, "Последовательность", "Укажи минимум два жеста через >"
+                self,
+                "Последовательность",
+                "Добавь минимум два жеста кнопкой «+ Шаг».",
             )
             return
         labels = list(ACTION_LABELS.values())
@@ -892,7 +1206,7 @@ class CameraWidget(QWidget):
         )
         self.store.replace_section("gesture_sequences", sequences)
         self.sequence_matcher.configure(sequences)
-        self.sequence_steps.clear()
+        self.sequence_builder.clear()
         self._refresh_sequences()
         self._set_camera_status("good", "Последовательность добавлена и активна")
 
@@ -952,13 +1266,27 @@ class CameraWidget(QWidget):
 
     def _mark_history_incorrect(self) -> None:
         rows = {index.row() for index in self.history_table.selectedIndexes()}
+        labels = []
         for row in rows:
             cell = self.history_table.item(row, 0)
             if cell is not None:
-                self.history.mark_incorrect(int(cell.data(Qt.UserRole)), True)
+                item_index = int(cell.data(Qt.UserRole))
+                self.history.mark_incorrect(item_index, True)
+                if 0 <= item_index < len(self.history.items):
+                    labels.append(self.history.items[item_index].gesture)
         self._refresh_history()
+        clip = None
+        if (
+            rows
+            and self.error_clips_check.isChecked()
+            and not self.privacy_mode_check.isChecked()
+        ):
+            clip = self.error_clips.save_recent(
+                "error_" + (labels[0] if labels else "gesture")
+            )
         self._set_camera_status(
             "good", "Ошибка сохранена — запись готова для будущего переобучения"
+            + (f" · ролик: {clip.name}" if clip else "")
         )
 
     def start(self) -> None:
@@ -1013,12 +1341,50 @@ class CameraWidget(QWidget):
             return
         self.video_capture.release()
         self.camera_id = new_id
-        self.video_capture = VideoCapture(new_id)
-        self.store.set("camera.device_index", new_id)
+        self.video_capture = VideoCapture(
+            new_id,
+            width=int(self.store.get("camera.capture_width", 960)),
+            height=int(self.store.get("camera.capture_height", 540)),
+            fps=int(self.store.get("camera.capture_fps", 30)),
+        )
+        self.store.update_many(
+            {"camera.device_index": new_id, "camera.use_network_camera": False}
+        )
         self._set_camera_status(
             "good" if self.video_capture.is_open else "bad",
             f"Камера {new_id} подключена" if self.video_capture.is_open else "Камера недоступна",
         )
+
+    def _connect_network_camera(self) -> None:
+        url = self.network_camera_url.text().strip()
+        if not url:
+            QMessageBox.warning(
+                self,
+                "Камера телефона",
+                "Укажи HTTP, HTTPS или RTSP адрес видеопотока.",
+            )
+            return
+        if not url.casefold().startswith(("http://", "https://", "rtsp://")):
+            QMessageBox.warning(
+                self, "Камера телефона", "Разрешены только HTTP(S) и RTSP адреса."
+            )
+            return
+        candidate = VideoCapture(
+            url,
+            width=int(self.store.get("camera.capture_width", 960)),
+            height=int(self.store.get("camera.capture_height", 540)),
+            fps=int(self.store.get("camera.capture_fps", 30)),
+        )
+        if not candidate.is_open:
+            candidate.release()
+            self._set_camera_status("bad", "Не удалось открыть поток телефона")
+            return
+        self.video_capture.release()
+        self.video_capture = candidate
+        self.store.update_many(
+            {"camera.network_url": url, "camera.use_network_camera": True}
+        )
+        self._set_camera_status("good", "Беспроводная камера подключена")
 
     def _choose_model(self) -> None:
         yolo = self.model_combo.currentData() == "yolo"
@@ -1101,6 +1467,11 @@ class CameraWidget(QWidget):
             return
         self.yolo_model = None
         if model == "built_in":
+            if self.model_manager.get_current_model() is None:
+                try:
+                    self.model_manager.load_built_in_model()
+                except (OSError, RuntimeError):
+                    pass
             self.recognizer.model = self.model_manager.get_current_model()
             self.recognizer.has_model = self.recognizer.model is not None
         else:
@@ -1122,6 +1493,8 @@ class CameraWidget(QWidget):
                 "camera.show_hands": self.show_hands.isChecked(),
                 "camera.show_face": self.show_face.isChecked(),
                 "camera.show_pose": self.show_pose.isChecked(),
+                "camera.privacy_mode": self.privacy_mode_check.isChecked(),
+                "camera.record_error_clips": self.error_clips_check.isChecked(),
             }
         )
 
@@ -1184,9 +1557,21 @@ class CameraWidget(QWidget):
         if self.roi_check.isChecked():
             roi = [slider.value() / 100.0 for slider in self.roi_sliders]
             frame, _ = apply_roi_mask(frame, roi)
+        if (
+            self.error_clips_check.isChecked()
+            and not self.privacy_mode_check.isChecked()
+            and self._last_hand_count > 0
+        ):
+            self.error_clips.push(frame)
+        self._collect_lighting_frame(frame)
 
         now = time.monotonic()
-        interval = int(self.store.get("camera.inference_interval_ms", 100)) / 1000.0
+        interval_ms = (
+            self._adaptive_interval_ms
+            if bool(self.store.get("hardware.auto_tune", True))
+            else int(self.store.get("camera.inference_interval_ms", 100))
+        )
+        interval = interval_ms / 1000.0
         if self.model_combo.currentData() == "yolo":
             interval = max(
                 interval,
@@ -1202,10 +1587,15 @@ class CameraWidget(QWidget):
                 self.show_hands.isChecked(),
                 self.show_pose.isChecked(),
             )
+            self._last_pixel_hands = [
+                list(points) for points in landmarks.get("hands", [])[:2]
+            ]
             self._update_hands(frame, landmarks)
             self._last_inference_ms = (
                 time.perf_counter() - inference_started
             ) * 1000.0
+        if self.privacy_mode_check.isChecked():
+            frame = privacy_silhouette(frame.shape, self._last_pixel_hands)
         if self.hud_check.isChecked():
             self._draw_hud(frame)
         self.set_image(self.video, frame)
@@ -1217,11 +1607,20 @@ class CameraWidget(QWidget):
         cutoff = now - 1.0
         self._frame_times = [stamp for stamp in self._frame_times if stamp >= cutoff]
         fps = max(0, len(self._frame_times) - 1)
+        if bool(self.store.get("hardware.auto_tune", True)):
+            self._adaptive_interval_ms = self.load_controller.update(
+                fps, self._last_inference_ms, now
+            )
         suffix = "рука" if self._last_hand_count == 1 else "руки"
         device = self.yolo_model.device.upper() if self.yolo_model else "CPU"
         self.performance_status.setText(
-            f"{fps} FPS · {self._last_hand_count} {suffix} · {device}"
+            f"{fps} FPS · {self._last_hand_count} {suffix} · {device} · "
+            f"{self.hardware_profile.tier.upper()}"
         )
+        if hasattr(self, "confidence_graph"):
+            self.confidence_graph.add_sample(
+                self._last_confidence, self._last_inference_ms
+            )
 
     def _draw_hud(self, frame: np.ndarray) -> None:
         model = str(self.model_combo.currentData()).upper()
@@ -1245,6 +1644,26 @@ class CameraWidget(QWidget):
                 1,
                 cv2.LINE_AA,
             )
+        height, width = frame.shape[:2]
+        cyan = (80, 222, 242)
+        length = max(22, min(width, height) // 18)
+        margin = 10
+        for x, y, sx, sy in (
+            (margin, margin, 1, 1),
+            (width - margin, margin, -1, 1),
+            (margin, height - margin, 1, -1),
+            (width - margin, height - margin, -1, -1),
+        ):
+            cv2.line(frame, (x, y), (x + sx * length, y), cyan, 1)
+            cv2.line(frame, (x, y), (x, y + sy * length), cyan, 1)
+        scan_y = int((time.monotonic() * 42) % max(1, height))
+        scan_overlay = frame.copy()
+        cv2.line(scan_overlay, (0, scan_y), (width, scan_y), (55, 170, 190), 1)
+        cv2.addWeighted(scan_overlay, 0.18, frame, 0.82, 0, frame)
+        center = (width // 2, height // 2)
+        cv2.circle(frame, center, 18, (55, 125, 140), 1)
+        cv2.line(frame, (center[0] - 28, center[1]), (center[0] - 9, center[1]), cyan, 1)
+        cv2.line(frame, (center[0] + 9, center[1]), (center[0] + 28, center[1]), cyan, 1)
 
     def _update_hands(self, frame: np.ndarray, landmarks: Dict[str, Any]) -> None:
         seen = set()
@@ -1264,12 +1683,31 @@ class CameraWidget(QWidget):
                 crop = self._crop(frame, coords, self.padding.value())
                 if crop is None:
                     continue
+                center_x = float(
+                    np.mean([point.x for point in raw_hand.landmark[:21]])
+                )
+                center_y = float(
+                    np.mean([point.y for point in raw_hand.landmark[:21]])
+                )
+                if center_y < 0.30:
+                    zone = "top"
+                elif center_y > 0.70:
+                    zone = "bottom"
+                elif center_x < 0.34:
+                    zone = "left"
+                elif center_x > 0.66:
+                    zone = "right"
+                else:
+                    zone = "center"
+                self._hand_zones[side] = zone
                 prediction = self._recognize_crop(crop, raw_hand)
                 gesture, confidence = prediction
                 preview = self.left_hand if side == "Left" else self.right_hand
-                preview.update_hand(
-                    "Левая" if side == "Left" else "Правая", gesture, confidence, crop
-                )
+                label = "Левая" if side == "Left" else "Правая"
+                if self.privacy_mode_check.isChecked():
+                    preview.update_private(label, gesture, confidence)
+                else:
+                    preview.update_hand(label, gesture, confidence, crop)
                 self._collect_calibration(raw_hand)
                 self._collect_custom_sample(side, raw_hand)
                 self._stabilize_and_fire(side, gesture, confidence)
@@ -1300,6 +1738,41 @@ class CameraWidget(QWidget):
         gesture = CANONICAL_GESTURE.get(gesture, gesture)
         confidence = 0.9 if gesture not in {"unknown", "no_gesture"} else 0.4
         return gesture, confidence
+
+    def _collect_lighting_frame(self, frame: np.ndarray) -> None:
+        if self._lighting_samples is None:
+            return
+        grey = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        brightness = float(np.mean(grey))
+        contrast = float(np.std(grey))
+        sharpness = float(cv2.Laplacian(grey, cv2.CV_32F).var())
+        self._lighting_samples.append((brightness, contrast, round(sharpness)))
+        count = len(self._lighting_samples)
+        if count < 40:
+            if count % 10 == 0:
+                self._set_camera_status("warn", f"Анализ камеры: {count}/40")
+            return
+        values = np.asarray(self._lighting_samples, dtype=np.float32)
+        mean_brightness, mean_contrast, mean_sharpness = values.mean(axis=0)
+        advice = []
+        if mean_brightness < 70:
+            advice.append("добавь источник света перед собой")
+        elif mean_brightness > 205:
+            advice.append("уменьши яркость или убери свет из объектива")
+        if mean_contrast < 28:
+            advice.append("фон и рука слишком похожи по тону")
+        if mean_sharpness < 45:
+            advice.append("протри объектив и зафиксируй камеру")
+        if self._last_hand_count == 0:
+            advice.append("поставь камеру так, чтобы кисть полностью входила в кадр")
+        message = (
+            f"Свет {mean_brightness:.0f}/255 · контраст {mean_contrast:.0f} · "
+            f"резкость {mean_sharpness:.0f}. "
+            + ("; ".join(advice) if advice else "Положение и свет хорошие.")
+        )
+        self._lighting_samples = None
+        QMessageBox.information(self, "Мастер камеры и света", message)
+        self._set_camera_status("good", "Анализ света и положения завершён")
 
     def _collect_calibration(self, raw_hand: Any) -> None:
         if self._calibration_samples is None or len(self._calibration_samples) >= 40:
@@ -1433,6 +1906,9 @@ class CameraWidget(QWidget):
             return
         for binding in self.bindings:
             if not binding.get("enabled", True) or binding.get("gesture") != gesture:
+                continue
+            zone = str(binding.get("zone", "any"))
+            if zone != "any" and zone != self._hand_zones.get(side, "any"):
                 continue
             if confidence < float(binding.get("confidence", 0.8)):
                 continue
@@ -1612,6 +2088,16 @@ class MainWindow(QMainWindow):
         self.core_status.setObjectName("CoreStatus")
         self.core_status.setAlignment(Qt.AlignCenter)
         side.addWidget(self.core_status)
+        profile = self.camera_page.hardware_profile
+        self.hardware_badge = QLabel(
+            f"{profile.tier.upper()} // {profile.score:02d}\n"
+            f"{profile.logical_cores}T · {profile.ram_gb:.0f}GB · "
+            f"{'CUDA' if profile.cuda_available else 'CPU'}"
+        )
+        self.hardware_badge.setObjectName("HardwareBadge")
+        self.hardware_badge.setAlignment(Qt.AlignCenter)
+        self.hardware_badge.setToolTip(profile.summary())
+        side.addWidget(self.hardware_badge)
         side.addSpacing(10)
         self.camera_button = QPushButton("01  CAMERA")
         self.assistant_button = QPushButton("02  ASSISTANT")

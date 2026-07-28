@@ -20,6 +20,15 @@ QLabel, QCheckBox, QRadioButton { background: transparent; }
 #Brand { font-size: 18pt; font-weight: 700; color: #73efff; letter-spacing: 3px; }
 #BrandCaption, [muted="true"] { color: #668690; }
 #CoreStatus { color: #55ebbd; font-size: 9pt; font-weight: 700; letter-spacing: 2px; }
+#HardwareBadge {
+    color: #78cdd7;
+    background: #081b24;
+    border: 1px solid #1d5360;
+    border-radius: 3px;
+    padding: 7px;
+    font-family: "Cascadia Mono";
+    font-size: 8.5pt;
+}
 #HudClock { color: #73cbd6; font-family: "Cascadia Mono"; font-size: 9pt; }
 #PageTitle {
     color: #bdf8ff;
@@ -43,6 +52,10 @@ QLabel, QCheckBox, QRadioButton { background: transparent; }
     background: #02090d;
     border: 1px solid #26707d;
     border-radius: 2px;
+}
+#TelemetryGraph {
+    border: 1px solid #20515d;
+    border-radius: 3px;
 }
 #StatusGood { color: #55e8b6; font-weight: 600; }
 #StatusNeutral { color: #76b9c3; font-weight: 600; }
@@ -166,6 +179,15 @@ QLabel, QCheckBox, QRadioButton { background: transparent; }
 #Brand { font-size: 18pt; font-weight: 700; color: #08798a; letter-spacing: 3px; }
 #BrandCaption, [muted="true"] { color: #5a7b82; }
 #CoreStatus { color: #0c8a68; font-size: 9pt; font-weight: 700; letter-spacing: 2px; }
+#HardwareBadge {
+    color: #246d78;
+    background: #e6f5f6;
+    border: 1px solid #9bcbd1;
+    border-radius: 3px;
+    padding: 7px;
+    font-family: "Cascadia Mono";
+    font-size: 8.5pt;
+}
 #HudClock { color: #287581; font-family: "Cascadia Mono"; font-size: 9pt; }
 #PageTitle {
     color: #0c5966;

@@ -65,6 +65,19 @@ The default high-quality Russian voice uses
 intonation and is distributed under CC-NC-BY. It is downloaded by
 `setup_venv.bat` into the Git-ignored `models/silero` directory.
 
+## Coqui TTS / XTTS v2 (optional)
+
+The consent-gated personal-voice option can install
+[coqui-tts](https://pypi.org/project/coqui-tts/) and use XTTS v2 lazily.
+The Python package is distributed under MPL-2.0. XTTS model terms are shown by
+the upstream downloader and must be accepted by the user before the model is
+used. No personal reference recording is bundled or committed.
+
+## pypdf
+
+Local PDF text extraction uses [pypdf](https://pypi.org/project/pypdf/),
+distributed under the BSD-3-Clause license.
+
 ## Faster-Whisper
 
 Local neural speech recognition uses

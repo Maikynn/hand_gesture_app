@@ -16,6 +16,7 @@ except Exception:
     _WhisperRuntime = None  # type: ignore[assignment]
 
 from utils.config_store import PROJECT_ROOT
+from assistant.voice_auth import VoiceAuthenticator
 
 try:
     from vosk import KaldiRecognizer, Model
@@ -45,6 +46,9 @@ class WakeWordListener:
         whisper_model: str = "",
         mic_index: Optional[int] = None,
         gain: float = 1.0,
+        noise_suppression: bool = True,
+        echo_suppression: bool = True,
+        language_mode: str = "ru",
     ):
         self.wake_word = wake_word
         self.wake_phrases = self._split_wake_phrases(wake_word)
@@ -54,6 +58,13 @@ class WakeWordListener:
         self.whisper_model = whisper_model
         self.mic_index = mic_index
         self.gain = max(0.5, min(10.0, float(gain)))
+        self.noise_suppression = bool(noise_suppression)
+        self.echo_suppression = bool(echo_suppression)
+        self.language_mode = language_mode if language_mode in {"ru", "auto"} else "ru"
+        self.voice_auth = VoiceAuthenticator()
+        self.last_speaker_score: Optional[float] = None
+        self._previous_audio: Optional[np.ndarray] = None
+        self._noise_floor = 180.0
         self.is_listening = False
         self.continuous_mode = False
         self.callback: Optional[Callable[[str], None]] = None
@@ -99,6 +110,9 @@ class WakeWordListener:
         mic_index: Optional[int],
         gain: float,
         whisper_model: Optional[str] = None,
+        noise_suppression: Optional[bool] = None,
+        echo_suppression: Optional[bool] = None,
+        language_mode: Optional[str] = None,
     ) -> None:
         was_listening = self.is_listening
         callback = self.callback
@@ -113,6 +127,14 @@ class WakeWordListener:
         self.stt_engine = (stt_engine or "vosk").lower()
         self.mic_index = mic_index
         self.gain = max(0.5, min(10.0, float(gain)))
+        if noise_suppression is not None:
+            self.noise_suppression = bool(noise_suppression)
+        if echo_suppression is not None:
+            self.echo_suppression = bool(echo_suppression)
+        if language_mode is not None:
+            self.language_mode = (
+                language_mode if language_mode in {"ru", "auto"} else "ru"
+            )
         if whisper_model is not None:
             self.whisper_model = whisper_model
         self._model = None
@@ -129,6 +151,7 @@ class WakeWordListener:
             if self.thread and self.thread.is_alive():
                 return False
             self.is_listening = True
+            self.last_speaker_score = None
             self.callback = callback
             self.continuous_mode = continuous
             self.status_callback = status_callback
@@ -200,13 +223,17 @@ class WakeWordListener:
                 kwargs["input_device_index"] = int(self.mic_index)
             stream = audio.open(**kwargs)
             recognizer = KaldiRecognizer(model, 16000)
+            utterance_chunks: List[np.ndarray] = []
             self._status("ready", "Vosk слушает локально")
             while self.is_listening:
                 data = stream.read(4000, exception_on_overflow=False)
-                samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                raw_samples = np.frombuffer(data, dtype=np.int16).copy()
+                utterance_chunks.append(raw_samples)
+                utterance_chunks = utterance_chunks[-40:]
+                samples = self._process_audio(raw_samples)
                 if self.gain != 1.0:
                     samples = np.clip(samples * self.gain, -32768, 32767).astype(np.int16)
-                    data = samples.tobytes()
+                data = samples.astype(np.int16).tobytes()
                 level_samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
                 level = (
                     float(np.sqrt(np.mean(level_samples * level_samples)))
@@ -219,7 +246,15 @@ class WakeWordListener:
                 if recognizer.AcceptWaveform(data):
                     text = str(json.loads(recognizer.Result()).get("text", "")).strip()
                     if text:
+                        if self.voice_auth.enrolled and utterance_chunks:
+                            try:
+                                self.last_speaker_score = self.voice_auth.score(
+                                    np.concatenate(utterance_chunks)
+                                )
+                            except ValueError:
+                                self.last_speaker_score = 0.0
                         self.process_recognized_text(text)
+                    utterance_chunks = []
         except Exception as exc:
             self._status("error", str(exc))
         finally:
@@ -248,7 +283,19 @@ class WakeWordListener:
                 try:
                     with microphone as source:
                         audio = recognizer.listen(source, timeout=1, phrase_time_limit=8)
-                    text = recognizer.recognize_google(audio, language="ru-RU")
+                    languages = (
+                        ("ru-RU", "en-US")
+                        if self.language_mode == "auto"
+                        else ("ru-RU",)
+                    )
+                    text = ""
+                    for language in languages:
+                        try:
+                            text = recognizer.recognize_google(audio, language=language)
+                            if text:
+                                break
+                        except sr.UnknownValueError:
+                            continue
                     if text:
                         self.process_recognized_text(text)
                 except sr.WaitTimeoutError:
@@ -281,6 +328,7 @@ class WakeWordListener:
                     "speech", "Слышу речь — озвучка прервана"
                 ),
                 on_final=self.process_recognized_text,
+                language=None if self.language_mode == "auto" else "ru",
             )
             self._whisper_stream = stream
             stream.start()
@@ -328,3 +376,21 @@ class WakeWordListener:
 
     def test_microphone(self) -> bool:
         return bool(self.list_input_devices())
+
+    def _process_audio(self, samples: np.ndarray) -> np.ndarray:
+        result = samples.astype(np.float32)
+        rms = float(np.sqrt(np.mean(result * result))) if result.size else 0.0
+        if self.noise_suppression:
+            if rms < self._noise_floor * 1.8:
+                self._noise_floor = self._noise_floor * 0.96 + rms * 0.04
+            threshold = max(90.0, self._noise_floor * 1.45)
+            if rms < threshold:
+                result *= 0.18
+        if (
+            self.echo_suppression
+            and self._previous_audio is not None
+            and self._previous_audio.size == result.size
+        ):
+            result = result - self._previous_audio * 0.12
+        self._previous_audio = samples.astype(np.float32)
+        return np.clip(result, -32768, 32767)

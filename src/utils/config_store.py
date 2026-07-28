@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
+from utils.credential_vault import CredentialVault
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_CONFIG_PATH = PROJECT_ROOT / "config.json"
@@ -54,10 +55,10 @@ def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
 class ConfigStore(QObject):
     """Thread-safe public/local settings store.
 
-    ``config.json`` contains versioned defaults. All choices made in the UI,
-    including secrets, are written to the git-ignored ``config.local.json``.
-    This keeps the repository clean and prevents an update from replacing a
-    user's camera, voice, permissions, commands, or API keys.
+    ``config.json`` contains versioned defaults. UI choices are written to the
+    git-ignored ``config.local.json``; API secrets use Windows Credential
+    Manager in the normal application store. This keeps the repository clean
+    and prevents updates from replacing personal settings.
     """
 
     changed = pyqtSignal(str, object)
@@ -73,9 +74,23 @@ class ConfigStore(QObject):
         self.public_path = public_path or PUBLIC_CONFIG_PATH
         self.local_path = local_path or LOCAL_CONFIG_PATH
         self._lock = threading.RLock()
+        self._vault = (
+            CredentialVault() if public_path is None and local_path is None else None
+        )
         self._public = _read_json(self.public_path)
         self._local = _read_json(self.local_path)
+        migrated = False
+        local_assistant = self._local.get("assistant")
+        if isinstance(local_assistant, dict) and self._vault is not None:
+            local_keys = local_assistant.get("api_keys")
+            if isinstance(local_keys, dict):
+                for provider, value in tuple(local_keys.items()):
+                    if str(value).strip() and self._vault.set(provider, str(value)):
+                        local_keys[provider] = ""
+                        migrated = True
         self._data = _deep_merge(self._public, self._local)
+        if migrated:
+            _write_json_atomic(self.local_path, self._local)
 
     def as_dict(self) -> Dict[str, Any]:
         with self._lock:
@@ -143,7 +158,18 @@ class ConfigStore(QObject):
         self.saved.emit()
 
     def api_key(self, provider: str) -> str:
+        if self._vault is not None:
+            secret = self._vault.get(provider)
+            if secret:
+                return secret
         return str(self.get(f"assistant.api_keys.{provider}", "") or "")
+
+    def set_api_key(self, provider: str, value: str) -> None:
+        secret = str(value).strip()
+        if self._vault is not None and self._vault.set(provider, secret):
+            self.set(f"assistant.api_keys.{provider}", "")
+            return
+        self.set(f"assistant.api_keys.{provider}", secret)
 
     def export_without_secrets(self) -> Dict[str, Any]:
         """Return a safe support snapshot suitable for logs or bug reports."""
