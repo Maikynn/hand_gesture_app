@@ -20,6 +20,7 @@ from faster_whisper import WhisperModel as _whisper_runtime  # noqa: F401
 from PyQt5.QtCore import QEvent, QObject, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
+    QAbstractScrollArea,
     QAbstractSpinBox,
     QAbstractItemView,
     QAction,
@@ -134,6 +135,15 @@ class ParameterWheelGuard(QObject):
         if event.type() == QEvent.Wheel and isinstance(
             watched, (QComboBox, QAbstractSpinBox, QSlider)
         ):
+            parent = watched.parentWidget()
+            while parent is not None and not isinstance(parent, QAbstractScrollArea):
+                parent = parent.parentWidget()
+            if parent is not None:
+                delta = event.angleDelta().y()
+                bar = parent.verticalScrollBar()
+                direction = -1 if delta > 0 else 1
+                steps = max(1, abs(delta) // 120)
+                bar.setValue(bar.value() + direction * bar.singleStep() * 3 * steps)
             event.ignore()
             return True
         return super().eventFilter(watched, event)
