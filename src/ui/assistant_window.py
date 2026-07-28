@@ -1,403 +1,461 @@
-#!/usr/bin/env python3
-"""
-Assistant Window for the Hand Gesture Application.
-Voice-controlled AI assistant named Axi with OpenRouter integration.
+"""Integrated assistant settings, permissions and chat page."""
 
-TTS / STT engines are selected from config.json (voice.tts_engine /
-voice.stt_engine). Silero TTS v5 and Whisper (bond005/whisper-podlodka-turbo)
-are used when configured and available, with automatic fallback to the
-offline pyttsx3 / Vosk engines.
-"""
+from __future__ import annotations
 
 import threading
-import time
-import subprocess
-import webbrowser
-import os
-import json
-from pathlib import Path
 
+from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit,
-    QPushButton, QSlider, QLineEdit, QGroupBox, QComboBox
+    QAbstractItemView,
+    QComboBox,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSlider,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextBrowser,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QObject
-from PyQt5.QtGui import QFont
 
-from assistant.openrouter_client import OpenRouterClient
-from assistant.tts_engine import TTSEngine
-from assistant.silero_tts import SileroTTSEngine, available as silero_available
-from assistant.whisper_stt import whisper_available
+from assistant.action_executor import ACTION_LABELS, ActionExecutor
+from assistant.jarvis_engine import JarvisEngine
 from assistant.listener import WakeWordListener
+from assistant.llm_client import LLMClient
+from assistant.silero_tts import SileroTTSEngine, available as silero_available
+from assistant.tts_engine import TTSEngine
+from utils.config_store import load_config, save_config
 from utils.logger import setup_logger
 
 
 class AssistantSignals(QObject):
-    """Signals for thread-safe UI updates."""
-    transcription_received = pyqtSignal(str)
-    response_received = pyqtSignal(str)
-    status_changed = pyqtSignal(str)
-    volume_changed = pyqtSignal(int)
+    answer = pyqtSignal(str)
+    status = pyqtSignal(str)
 
 
 class AssistantWindow(QWidget):
-    """
-    Voice assistant interface with wake-word detection, OpenRouter, and TTS.
-    """
-    def __init__(self, parent=None):
+    """A complete assistant embedded into the main application tab."""
+
+    config_saved = pyqtSignal(dict)
+
+    def __init__(self, config=None, parent=None):
         super().__init__(parent)
-        self.parent = parent
         self.logger = setup_logger("AssistantWindow")
-
-        self.config = self._load_config()
-        voice = self.config.get("voice", {})
-
-        # Initialize components
-        self.openrouter = OpenRouterClient()
-        self.tts = self._build_tts(voice)
-        self.listener = WakeWordListener(
-            wake_word=voice.get("wake_word", "аксиос"),
-            stt_engine=voice.get("stt_engine", "vosk"),
-            whisper_model=voice.get("whisper_model", "bond005/whisper-podlodka-turbo"),
-            mic_index=voice.get("mic_index"),
-            gain=voice.get("mic_gain", 10.0),
-        )
-
-        # State
+        self.config = config if config is not None else load_config()
+        self.voice = self.config["voice"]
         self.is_listening = False
-        self.api_key = voice.get("openrouter_key", "")
-        self.system_prompt = voice.get(
-            "system_prompt",
-            "Ты — голосовой помощник Акси. Отвечай кратко и по делу на русском."
-        )
-
-        # Signals for thread-safe UI updates
         self.signals = AssistantSignals()
-        self.signals.transcription_received.connect(self.add_transcription)
-        self.signals.response_received.connect(self.add_response)
-        self.signals.status_changed.connect(self.update_status)
-        self.signals.volume_changed.connect(self.update_volume_slider)
+        self.signals.answer.connect(self._show_answer)
+        self.signals.status.connect(self._set_status)
+        self.executor = ActionExecutor(self.voice.get("allowed_apps", []))
+        self.tts = self._build_tts()
+        self.listener = None
+        self.jarvis = None
+        self._build_ui()
+        self._load_values()
+        self._rebuild_services()
 
-        self.init_ui()
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 20)
+        title = QLabel("Голосовой помощник")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel(
+            "Настройте голос, доступы и способ ответа — затем общайтесь в чате."
+        )
+        subtitle.setObjectName("muted")
+        root.addWidget(title)
+        root.addWidget(subtitle)
 
-    # ----------------------------- config / engines -----------------------------
-    def _load_config(self) -> dict:
-        """Load config.json from the project root (hand_gesture_app)."""
-        try:
-            root = Path(__file__).resolve().parent.parent.parent
-            cfg_path = root / "config.json"
-            if cfg_path.exists():
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception as e:
-            print(f"[AssistantWindow] config load error: {e}")
-        return {}
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._settings_panel())
+        splitter.addWidget(self._chat_panel())
+        splitter.setSizes([500, 780])
+        root.addWidget(splitter, 1)
 
-    def _build_tts(self, voice: dict):
-        """Build the TTS engine from config, falling back to pyttsx3."""
-        engine = (voice.get("tts_engine") or "pyttsx3").lower()
-        speaker = voice.get("tts_speaker") or "xenia"
-        rate = int(voice.get("tts_rate", 196))
-        volume = float(voice.get("volume", 0.9))
-        if engine == "silero" and silero_available():
-            try:
-                print("[AssistantWindow] using Silero TTS v5")
-                return SileroTTSEngine(speaker=speaker, rate=rate, volume=volume)
-            except Exception as e:
-                print(f"[AssistantWindow] Silero TTS failed, falling back to pyttsx3: {e}")
-        print("[AssistantWindow] using pyttsx3 TTS")
-        return TTSEngine(rate=rate, volume=volume)
+    def _settings_panel(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(0, 0, 10, 0)
 
-    def init_ui(self):
-        """Initialize the assistant UI."""
-        self.layout = QVBoxLayout()
-        self.layout.setSpacing(10)
-        self.layout.setContentsMargins(10, 10, 10, 10)
+        voice_box = QGroupBox("Голос и активация")
+        form = QFormLayout(voice_box)
+        self.wake_word = QLineEdit()
+        self.stt_engine = QComboBox()
+        self.stt_engine.addItems(["vosk", "whisper"])
+        self.tts_engine = QComboBox()
+        self.tts_engine.addItems(["pyttsx3", "silero"])
+        self.volume = QSlider(Qt.Horizontal)
+        self.volume.setRange(0, 100)
+        form.addRow("Фраза активации", self.wake_word)
+        form.addRow("Распознавание речи", self.stt_engine)
+        form.addRow("Озвучивание", self.tts_engine)
+        form.addRow("Громкость", self.volume)
+        layout.addWidget(voice_box)
 
-        # Title
-        title_label = QLabel("Axi - Voice Assistant")
-        title_label.setFont(QFont("Arial", 16, QFont.Bold))
-        title_label.setAlignment(Qt.AlignCenter)
-        self.layout.addWidget(title_label)
+        ai_box = QGroupBox("Ответы на общие вопросы")
+        ai_form = QFormLayout(ai_box)
+        self.provider = QComboBox()
+        self.provider.addItem("Без AI — веселая ошибка", "none")
+        self.provider.addItem("OpenRouter", "openrouter")
+        self.provider.addItem("Локальная Ollama", "ollama")
+        self.provider.addItem("Другое OpenAI-compatible API", "custom")
+        self.api_key = QLineEdit()
+        self.api_key.setEchoMode(QLineEdit.Password)
+        self.model = QLineEdit()
+        self.api_url = QLineEdit()
+        self.system_prompt = QTextEdit()
+        self.system_prompt.setMaximumHeight(80)
+        self.provider.currentIndexChanged.connect(self._provider_visibility)
+        ai_form.addRow("Провайдер", self.provider)
+        ai_form.addRow("API-ключ", self.api_key)
+        ai_form.addRow("Модель", self.model)
+        ai_form.addRow("URL API / Ollama", self.api_url)
+        ai_form.addRow("Характер помощника", self.system_prompt)
+        layout.addWidget(ai_box)
 
-        # Engine status
-        tts_name = "Silero TTS v5" if isinstance(self.tts, SileroTTSEngine) else "pyttsx3"
-        stt_name = "Whisper" if self.listener.stt_engine == "whisper" else "Vosk"
-        self.engine_label = QLabel(f"TTS: {tts_name}   |   STT: {stt_name}")
-        self.engine_label.setAlignment(Qt.AlignCenter)
-        self.layout.addWidget(self.engine_label)
+        app_box = QGroupBox("Разрешенные приложения")
+        app_layout = QVBoxLayout(app_box)
+        hint = QLabel("Помощник сможет запустить только приложения из этого списка.")
+        hint.setObjectName("muted")
+        app_layout.addWidget(hint)
+        self.apps = QTableWidget(0, 2)
+        self.apps.setHorizontalHeaderLabels(["Название", "Полный путь к программе"])
+        self._prepare_table(self.apps)
+        app_layout.addWidget(self.apps)
+        buttons = QHBoxLayout()
+        add_app = QPushButton("＋ Добавить программу")
+        add_app.clicked.connect(self._add_app)
+        remove_app = QPushButton("Удалить")
+        remove_app.clicked.connect(lambda: self._remove_row(self.apps))
+        buttons.addWidget(add_app)
+        buttons.addWidget(remove_app)
+        app_layout.addLayout(buttons)
+        layout.addWidget(app_box)
 
-        # Status indicator
-        self.status_label = QLabel("Status: Idle")
-        self.status_label.setAlignment(Qt.AlignCenter)
-        self.layout.addWidget(self.status_label)
+        cmd_box = QGroupBox("Свои голосовые команды")
+        cmd_layout = QVBoxLayout(cmd_box)
+        self.commands = QTableWidget(0, 3)
+        self.commands.setHorizontalHeaderLabels(
+            ["Фразы через |", "Действие", "Путь / URL / клавиши"]
+        )
+        self._prepare_table(self.commands)
+        cmd_layout.addWidget(self.commands)
+        cmd_buttons = QHBoxLayout()
+        add_cmd = QPushButton("＋ Добавить команду")
+        add_cmd.clicked.connect(self._add_command)
+        remove_cmd = QPushButton("Удалить")
+        remove_cmd.clicked.connect(lambda: self._remove_row(self.commands))
+        cmd_buttons.addWidget(add_cmd)
+        cmd_buttons.addWidget(remove_cmd)
+        cmd_layout.addLayout(cmd_buttons)
+        layout.addWidget(cmd_box)
 
-        # Wake-word indicator
-        self.wake_word_label = QLabel("Wake word: 'аксиос'")
-        self.wake_word_label.setAlignment(Qt.AlignCenter)
-        self.layout.addWidget(self.wake_word_label)
+        save = QPushButton("Сохранить настройки помощника")
+        save.setObjectName("primaryButton")
+        save.clicked.connect(self.save_settings)
+        layout.addWidget(save)
+        layout.addStretch()
+        scroll.setWidget(body)
+        return scroll
 
-        # API Key input
-        api_group = QGroupBox("OpenRouter Settings")
-        api_layout = QVBoxLayout()
-        api_key_layout = QHBoxLayout()
-        api_key_label = QLabel("API Key:")
-        self.api_key_input = QLineEdit()
-        self.api_key_input.setEchoMode(QLineEdit.Password)
-        self.api_key_input.setPlaceholderText("Enter OpenRouter API key")
-        self.api_key_input.textChanged.connect(self.on_api_key_changed)
-        if self.api_key:
-            self.api_key_input.setText(self.api_key)
-        api_key_layout.addWidget(api_key_label)
-        api_key_layout.addWidget(self.api_key_input)
-        api_layout.addLayout(api_key_layout)
+    def _chat_panel(self):
+        panel = QFrame()
+        panel.setObjectName("chatPanel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(18, 18, 18, 18)
+        top = QHBoxLayout()
+        self.status = QLabel("● Готов")
+        self.listen = QPushButton("🎙 Начать слушать")
+        self.listen.clicked.connect(self.toggle_listening)
+        test = QPushButton("Проверить голос")
+        test.clicked.connect(lambda: self.tts.speak("Привет! Я готов помогать."))
+        top.addWidget(self.status)
+        top.addStretch()
+        top.addWidget(test)
+        top.addWidget(self.listen)
+        layout.addLayout(top)
+        self.chat = QTextBrowser()
+        self.chat.setOpenExternalLinks(True)
+        self.chat.append(
+            "<b>Акси</b><br>Привет! Я могу запустить разрешенную программу, выполнить вашу команду или ответить на вопрос."
+        )
+        layout.addWidget(self.chat, 1)
+        row = QHBoxLayout()
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Напишите команду или вопрос…")
+        self.input.returnPressed.connect(self.send_message)
+        send = QPushButton("Отправить ➜")
+        send.setObjectName("primaryButton")
+        send.clicked.connect(self.send_message)
+        row.addWidget(self.input, 1)
+        row.addWidget(send)
+        layout.addLayout(row)
+        return panel
 
-        # Model selection
-        model_layout = QHBoxLayout()
-        model_label = QLabel("Model:")
-        self.model_combo = QComboBox()
-        self.model_combo.addItems(["free", "gpt-3.5-turbo", "claude-3-haiku", "gemini-pro"])
-        self.model_combo.currentTextChanged.connect(self.on_model_changed)
-        model_layout.addWidget(model_label)
-        model_layout.addWidget(self.model_combo)
-        api_layout.addLayout(model_layout)
+    @staticmethod
+    def _prepare_table(table):
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setMinimumHeight(150)
 
-        api_group.setLayout(api_layout)
-        self.layout.addWidget(api_group)
+    def _load_values(self):
+        v = self.voice
+        self.wake_word.setText(v.get("wake_word", "аксиос"))
+        self.stt_engine.setCurrentText(v.get("stt_engine", "vosk"))
+        self.tts_engine.setCurrentText(v.get("tts_engine", "pyttsx3"))
+        self.volume.setValue(int(v.get("volume", 0.9) * 100))
+        idx = self.provider.findData(v.get("llm_engine", "none"))
+        self.provider.setCurrentIndex(max(0, idx))
+        engine = v.get("llm_engine", "none")
+        self.api_key.setText(
+            v.get("custom_api_key" if engine == "custom" else "openrouter_key", "")
+        )
+        self.model.setText(
+            v.get(
+                "ollama_model"
+                if engine == "ollama"
+                else "custom_api_model"
+                if engine == "custom"
+                else "openrouter_model",
+                "",
+            )
+        )
+        self.api_url.setText(
+            v.get("custom_api_url" if engine == "custom" else "ollama_url", "")
+        )
+        self.system_prompt.setPlainText(v.get("system_prompt", ""))
+        for app in v.get("allowed_apps", []):
+            self._append_items(self.apps, [app.get("name", ""), app.get("path", "")])
+        for cmd in v.get("commands", []):
+            self._add_command(cmd)
+        self._provider_visibility()
 
-        # Transcription display
-        transcription_group = QGroupBox("Transcription Log")
-        transcription_layout = QVBoxLayout()
-        self.transcription_text = QTextEdit()
-        self.transcription_text.setReadOnly(True)
-        self.transcription_text.setMaximumHeight(120)
-        transcription_layout.addWidget(self.transcription_text)
-        transcription_group.setLayout(transcription_layout)
-        self.layout.addWidget(transcription_group)
+    @staticmethod
+    def _append_items(table, values):
+        row = table.rowCount()
+        table.insertRow(row)
+        for col, value in enumerate(values):
+            table.setItem(row, col, QTableWidgetItem(str(value)))
+        return row
 
-        # Response display
-        response_group = QGroupBox("Assistant Response")
-        response_layout = QVBoxLayout()
-        self.response_text = QTextEdit()
-        self.response_text.setReadOnly(True)
-        self.response_text.setMaximumHeight(120)
-        response_layout.addWidget(self.response_text)
-        response_group.setLayout(response_layout)
-        self.layout.addWidget(response_group)
+    def _add_app(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Выберите приложение")
+        if path:
+            name = path.replace("\\", "/").split("/")[-1].rsplit(".", 1)[0]
+            self._append_items(self.apps, [name, path])
 
-        # Volume control
-        volume_group = QGroupBox("Volume")
-        volume_layout = QHBoxLayout()
-        volume_label = QLabel("Volume:")
-        self.volume_slider = QSlider(Qt.Horizontal)
-        self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(int(self.config.get("voice", {}).get("volume", 0.9) * 100))
-        self.volume_slider.valueChanged.connect(self.on_volume_changed)
-        volume_layout.addWidget(volume_label)
-        volume_layout.addWidget(self.volume_slider)
-        volume_group.setLayout(volume_layout)
-        self.layout.addWidget(volume_group)
+    def _add_command(self, command=None):
+        command = command or {"phrase": "", "action": "open_app", "value": ""}
+        row = self._append_items(
+            self.commands, [command.get("phrase", ""), "", command.get("value", "")]
+        )
+        combo = QComboBox()
+        for key, label in ACTION_LABELS.items():
+            combo.addItem(label, key)
+        index = combo.findData(command.get("action", "none"))
+        combo.setCurrentIndex(max(0, index))
+        self.commands.setCellWidget(row, 1, combo)
 
-        # Command input
-        command_group = QGroupBox("Quick Command / Question")
-        command_layout = QHBoxLayout()
-        self.command_input = QLineEdit()
-        self.command_input.setPlaceholderText("Type command or ask question...")
-        self.command_input.returnPressed.connect(self.on_send_command)
-        self.send_button = QPushButton("Send")
-        self.send_button.clicked.connect(self.on_send_command)
-        command_layout.addWidget(self.command_input)
-        command_layout.addWidget(self.send_button)
-        command_group.setLayout(command_layout)
-        self.layout.addWidget(command_group)
+    @staticmethod
+    def _remove_row(table):
+        if table.currentRow() >= 0:
+            table.removeRow(table.currentRow())
 
-        # Control buttons
-        control_layout = QHBoxLayout()
-        self.start_button = QPushButton("Start Listening")
-        self.start_button.clicked.connect(self.toggle_listening)
-        self.clear_button = QPushButton("Clear Log")
-        self.clear_button.clicked.connect(self.clear_log)
-        self.test_tts_button = QPushButton("Test TTS")
-        self.test_tts_button.clicked.connect(self.test_tts)
-        control_layout.addWidget(self.start_button)
-        control_layout.addWidget(self.clear_button)
-        control_layout.addWidget(self.test_tts_button)
-        self.layout.addLayout(control_layout)
+    def _provider_visibility(self):
+        engine = self.provider.currentData()
+        self.api_key.setEnabled(engine in {"openrouter", "custom"})
+        self.api_url.setEnabled(engine in {"ollama", "custom"})
+        self.model.setEnabled(engine != "none")
 
-        self.setLayout(self.layout)
+    def save_settings(self):
+        engine = self.provider.currentData()
+        v = self.config["voice"]
+        v.update(
+            {
+                "wake_word": self.wake_word.text().strip() or "аксиос",
+                "stt_engine": self.stt_engine.currentText(),
+                "tts_engine": self.tts_engine.currentText(),
+                "volume": self.volume.value() / 100,
+                "llm_engine": engine,
+                "system_prompt": self.system_prompt.toPlainText().strip(),
+            }
+        )
+        if engine == "openrouter":
+            v.update(
+                openrouter_key=self.api_key.text().strip(),
+                openrouter_model=self.model.text().strip(),
+            )
+        elif engine == "ollama":
+            v.update(
+                ollama_url=self.api_url.text().strip(),
+                ollama_model=self.model.text().strip(),
+            )
+        elif engine == "custom":
+            v.update(
+                custom_api_url=self.api_url.text().strip(),
+                custom_api_key=self.api_key.text().strip(),
+                custom_api_model=self.model.text().strip(),
+            )
+        v["allowed_apps"] = [
+            {"name": self._cell(self.apps, r, 0), "path": self._cell(self.apps, r, 1)}
+            for r in range(self.apps.rowCount())
+            if self._cell(self.apps, r, 1)
+        ]
+        v["commands"] = [
+            {
+                "phrase": self._cell(self.commands, r, 0).casefold(),
+                "action": self.commands.cellWidget(r, 1).currentData(),
+                "value": self._cell(self.commands, r, 2),
+            }
+            for r in range(self.commands.rowCount())
+            if self._cell(self.commands, r, 0)
+        ]
+        save_config(self.config)
+        self.voice = v
+        self.executor.update_allowed_apps(v["allowed_apps"])
+        self._rebuild_services(rebuild_tts=True)
+        self.config_saved.emit(self.config)
+        QMessageBox.information(self, "Готово", "Настройки помощника сохранены.")
 
-    def apply_settings(self, settings: dict):
-        """Apply settings from settings window."""
-        # Could apply volume, etc. from settings
-        if 'volume' in settings:
-            self.volume_slider.setValue(int(settings['volume'] * 100))
-        elif self.config.get("voice", {}).get("volume") is not None:
-            self.volume_slider.setValue(int(self.config["voice"]["volume"] * 100))
+    @staticmethod
+    def _cell(table, row, col):
+        item = table.item(row, col)
+        return item.text().strip() if item else ""
 
-    def on_api_key_changed(self, text: str):
-        """Handle API key change."""
-        self.api_key = text
-        self.openrouter.set_api_key(text)
+    def _build_tts(self):
+        v = self.voice
+        if v.get("tts_engine") == "silero" and silero_available():
+            return SileroTTSEngine(
+                speaker=v.get("tts_speaker", "xenia"),
+                rate=v.get("tts_rate", 190),
+                volume=v.get("volume", 0.9),
+            )
+        return TTSEngine(rate=v.get("tts_rate", 190), volume=v.get("volume", 0.9))
 
-    def on_model_changed(self, model: str):
-        """Handle model selection change."""
-        self.openrouter.set_model(model)
+    def _rebuild_services(self, rebuild_tts=False):
+        if self.listener:
+            self.listener.stop_listening()
+        self.listener = None
+        v = self.voice
+        if rebuild_tts:
+            self.tts.shutdown()
+            self.tts = self._build_tts()
+        self.llm = LLMClient(
+            engine=v.get("llm_engine", "none"),
+            api_key=v.get("openrouter_key", ""),
+            model=v.get("openrouter_model", ""),
+            ollama_url=v.get("ollama_url", ""),
+            ollama_model=v.get("ollama_model", ""),
+            system_prompt=v.get("system_prompt", ""),
+            custom_api_url=v.get("custom_api_url", ""),
+            custom_api_key=v.get("custom_api_key", ""),
+            custom_api_model=v.get("custom_api_model", ""),
+        )
+        if self.jarvis is None:
+            self.jarvis = JarvisEngine(v, self.executor, self.llm)
+        else:
+            self.jarvis.update(v, self.executor, self.llm)
 
-    def on_volume_changed(self, value: int):
-        """Handle volume slider change."""
-        self.tts.set_volume(value / 100.0)
-
-    def update_volume_slider(self, value: int):
-        """Update volume slider from signal."""
-        self.volume_slider.setValue(value)
+    def _ensure_listener(self):
+        if self.listener is None:
+            v = self.voice
+            self.listener = WakeWordListener(
+                wake_word=v.get("wake_word", "аксиос"),
+                model_path=v.get("vosk_model_path", "models/vosk-ru"),
+                stt_engine=v.get("stt_engine", "vosk"),
+                whisper_model=v.get("whisper_model", ""),
+                mic_index=v.get("mic_index"),
+                gain=v.get("mic_gain", 2),
+            )
 
     def toggle_listening(self):
-        """Toggle voice listening state."""
         self.is_listening = not self.is_listening
         if self.is_listening:
-            self.start_button.setText("Stop Listening")
-            self.signals.status_changed.emit("Status: Listening for 'аксиос'...")
-            self.listener.start_listening(self.on_wake_word_detected)
+            try:
+                self._ensure_listener()
+                self.listener.start_listening(self._voice_command)
+            except Exception as exc:
+                self.is_listening = False
+                self._set_status("⚠ Микрофон недоступен")
+                QMessageBox.warning(self, "Не удалось начать прослушивание", str(exc))
+                return
+            self.listen.setText("■ Остановить")
+            self._set_status(f"● Слушаю «{self.voice.get('wake_word')}»")
         else:
-            self.start_button.setText("Start Listening")
-            self.signals.status_changed.emit("Status: Idle")
-            self.listener.stop_listening()
+            if self.listener:
+                self.listener.stop_listening()
+            self.listen.setText("🎙 Начать слушать")
+            self._set_status("● Готов")
 
-    def on_wake_word_detected(self, command: str):
-        """Handle wake word detection with command."""
-        if not command:
-            # Wake word detected but no command - just acknowledge
-            self.signals.transcription_received.emit("[Wake word detected]")
+    def _voice_command(self, text):
+        self.signals.answer.emit(f"__USER__{text}")
+        self.process_command(text)
+
+    def send_message(self):
+        text = self.input.text().strip()
+        if not text:
             return
+        self.input.clear()
+        self._append_message("Вы", text, "user")
+        self.process_command(text)
 
-        self.signals.transcription_received.emit(command)
-        self.process_command(command)
+    def process_command(self, text):
+        self.signals.status.emit("● Выполняю…")
+        threading.Thread(target=self._process, args=(text,), daemon=True).start()
 
-    def on_send_command(self):
-        """Send typed command to assistant."""
-        command = self.command_input.text()
-        if command:
-            self.signals.transcription_received.emit(command)
-            self.process_command(command)
-            self.command_input.clear()
-
-    def process_command(self, command: str):
-        """Process user command."""
-        self.signals.status_changed.emit("Status: Processing...")
-
-        # Run in background thread
-        thread = threading.Thread(target=self._process_command_thread, args=(command,))
-        thread.daemon = True
-        thread.start()
-
-    def _process_command_thread(self, command: str):
-        """Process command in background thread."""
+    def _process(self, text):
         try:
-            command_lower = command.lower()
-
-            # Check for system commands
-            if any(cmd in command_lower for cmd in ["открой", "open", "запусти", "run"]):
-                self.execute_system_command(command)
-            elif "открой ссылку" in command_lower or "open link" in command_lower:
-                self.open_url(command)
-            else:
-                # Send to OpenRouter for general questions
-                if not self.api_key:
-                    self.signals.response_received.emit(
-                        "Error: OpenRouter API key not set. Please enter it in the settings above."
-                    )
-                    self.signals.status_changed.emit("Status: Idle")
-                    return
-
-                self.signals.response_received.emit("Thinking...")
-                response = self.openrouter.send_message(command, self.system_prompt)
-                self.signals.response_received.emit(response)
-                # Speak response
-                self.tts.speak(response)
-
-        except Exception as e:
-            self.logger.error(f"Error processing command: {e}")
-            self.signals.response_received.emit(f"Error: {str(e)}")
+            reply = self.jarvis.process(text)
+            self.signals.answer.emit(reply.text)
+        except Exception as exc:
+            self.logger.exception("Assistant command failed")
+            self.signals.answer.emit(f"Ой, команда споткнулась об ошибку: {exc}")
         finally:
-            self.signals.status_changed.emit("Status: Listening for 'аксиос'..." if self.is_listening else "Status: Idle")
+            self.signals.status.emit("● Слушаю" if self.is_listening else "● Готов")
 
-    def execute_system_command(self, command: str):
-        """Execute system command (open file, run app)."""
-        # Extract target from command
-        parts = command.split()
-        target = None
-        for i, part in enumerate(parts):
-            if part.lower() in ["открой", "open", "запусти", "run"]:
-                if i + 1 < len(parts):
-                    target = " ".join(parts[i + 1:])  # Rest of command as target
-                    break
+    def _show_answer(self, text):
+        if text.startswith("__USER__"):
+            self._append_message("Вы", text[8:], "user")
+            return
+        self._append_message("Акси", text, "assistant")
+        self.tts.speak(text)
 
-        if target:
-            self.signals.response_received.emit(f"Opening {target}...")
-            try:
-                if os.name == 'nt':  # Windows
-                    os.startfile(target)
-                else:  # Linux/Mac
-                    subprocess.Popen(['xdg-open', target])
-                self.signals.response_received.emit(f"Opened {target}")
-            except Exception as e:
-                self.signals.response_received.emit(f"Failed to open {target}: {e}")
-        else:
-            self.signals.response_received.emit("Please specify what to open")
+    def _append_message(self, author, text, role):
+        color = "#6c8cff" if role == "user" else "#36c993"
+        safe = (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\n", "<br>")
+        )
+        self.chat.append(
+            f'<div style="margin:10px 0"><b style="color:{color}">{author}</b><br>{safe}</div>'
+        )
 
-    def open_url(self, command: str):
-        """Open URL from command."""
-        parts = command.split()
-        url = None
-        for i, part in enumerate(parts):
-            if part.lower() in ["ссылку", "link", "url"]:
-                if i + 1 < len(parts):
-                    url = parts[i + 1]
-                    break
+    def _set_status(self, text):
+        self.status.setText(text)
 
-        if not url:
-            # Try to find URL in command
-            for part in parts:
-                if part.startswith(('http://', 'https://', 'www.')):
-                    url = part
-                    break
-
-        if url:
-            if not url.startswith(('http://', 'https://')):
-                url = 'https://' + url
-            self.signals.response_received.emit(f"Opening {url}...")
-            try:
-                webbrowser.open(url)
-                self.signals.response_received.emit(f"Opened {url}")
-            except Exception as e:
-                self.signals.response_received.emit(f"Failed to open URL: {e}")
-        else:
-            self.signals.response_received.emit("Please specify a URL to open")
-
-    def add_transcription(self, text: str):
-        """Add transcription to display."""
-        timestamp = time.strftime("%H:%M:%S")
-        self.transcription_text.append(f"[{timestamp}] {text}")
-
-    def add_response(self, text: str):
-        """Add response to display."""
-        timestamp = time.strftime("%H:%M:%S")
-        self.response_text.append(f"[{timestamp}] {text}")
-
-    def update_status(self, text: str):
-        """Update status label."""
-        self.status_label.setText(text)
-
-    def clear_log(self):
-        """Clear transcription and response logs."""
-        self.transcription_text.clear()
-        self.response_text.clear()
-
-    def test_tts(self):
-        """Test TTS engine."""
-        self.tts.speak("Привет! Я Акси, ваш голосовой помощник. Тест синтеза речи работает.")
+    def apply_settings(self, _settings):
+        pass
 
     def cleanup(self):
-        """Cleanup resources."""
-        self.listener.stop_listening()
+        if self.listener:
+            self.listener.stop_listening()
         self.tts.shutdown()

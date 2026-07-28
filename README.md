@@ -1,32 +1,36 @@
 # Hand Gesture Application
 
-A production-ready desktop application with a terminal-style interface featuring three windows: **Settings**, **Camera**, and **Assistant**.
+A desktop application for controlling a computer with hand gestures and the
+integrated Axi voice assistant. The modern interface has two focused tabs:
+**Camera** and **Assistant**; all related settings live next to the feature they
+configure, so there is no separate settings page.
 
 ## Features
 
-### 1. Settings Window
-- Camera device selection
-- Skeleton visualization toggles (face / hand / body)
-- Skeleton line thickness slider
-- Hand crop calibration padding slider
-- Custom model loading (`.tflite` or `.onnx`)
-
-### 2. Camera Window
+### 1. Camera tab
 - Live webcam feed with real-time skeleton overlay
-- MediaPipe Face Mesh, Hands, and Pose detection
-- 150×150 px hand-crop window (with configurable padding)
-- Real-time gesture recognition with gesture name + palm-side display
+- Separate left/right hand previews with gesture names and confidence
+- Camera, recognition model, and brightness controls
+- Configurable actions for each hand/gesture pair, with safe defaults
 - Rule-based recognition fallback (works without a trained model)
 - Optional trained model support (TFLite / ONNX) for higher accuracy
 
-### 3. Assistant Window ("Axi")
-- Wake-word detection: **"аксиос"** (Russian for "axios")
-- Speech-to-text via Vosk (offline) or SpeechRecognition (online fallback)
-- OpenRouter API integration for AI responses (free tier supported)
-- Text-to-speech via pyttsx3 (offline)
-- Command execution: "открой" / "open", "запусти" / "run", "открой ссылку" / "open link"
-- Volume control, transcription log, response log
-- Text input for typed commands (works without microphone)
+### 2. Assistant tab ("Axi")
+- Embedded command core based on the command/alias approach used by
+  [Priler/Jarvis](https://github.com/Priler/jarvis); it runs inside this tab and
+  is not launched as a separate application
+- Editable wake phrase and Vosk/Whisper speech recognition
+- Integrated chat and pyttsx3/Silero speech output
+- OpenRouter, local Ollama, or any OpenAI-compatible API
+- A friendly configurable fallback phrase when no AI provider is available
+- Explicit application allow-list: arbitrary programs cannot be launched
+- User-defined phrases mapped to application, URL, volume, or hotkey actions
+- Dark and light themes available from the main header
+
+> Security: API keys are blank in the repository. Add them through the Assistant
+> tab on your own machine and never commit a populated `config.json`.
+> Runtime settings and secrets are written atomically to the ignored
+> `config.local.json`; the tracked `config.json` remains a safe template.
 
 ## Architecture
 

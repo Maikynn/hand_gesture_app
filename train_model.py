@@ -10,7 +10,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple
 
 # Gesture classes (40 gestures + unknown)
 GESTURE_CLASSES = [
@@ -113,7 +113,7 @@ def train(data_dir: str, model_path: str = "models/built_in.tflite",
     
     # Train
     print("Training...")
-    history = model.fit(
+    model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
         epochs=epochs,

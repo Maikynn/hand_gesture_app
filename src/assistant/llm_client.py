@@ -27,7 +27,9 @@ class LLMClient:
     def __init__(self, engine: str = "openrouter", api_key: str = "",
                  model: str = "", ollama_url: str = "http://localhost:11434",
                  ollama_model: str = "llama3", system_prompt: str = "",
-                 max_tokens: int = 200, fallback_models: Optional[List[str]] = None):
+                 max_tokens: int = 200, fallback_models: Optional[List[str]] = None,
+                 custom_api_url: str = "", custom_api_key: str = "",
+                 custom_api_model: str = ""):
         self.engine = (engine or "openrouter").lower()
         self.api_key = api_key or ""
         self.model = model or ""
@@ -38,12 +40,44 @@ class LLMClient:
         # Ordered list of alternative OpenRouter models to try when the
         # primary is rate-limited / unavailable.
         self.fallback_models = [m for m in (fallback_models or []) if m]
+        self.custom_api_url = custom_api_url
+        self.custom_api_key = custom_api_key
+        self.custom_api_model = custom_api_model
 
     def send_message(self, message: str, system_prompt: Optional[str] = None) -> Optional[str]:
         sp = self.system_prompt if system_prompt is None else system_prompt
         if self.engine == "ollama":
             return self._ollama(message, sp)
+        if self.engine == "custom":
+            return self._custom(message, sp)
+        if self.engine == "none":
+            return None
         return self._openrouter(message, sp)
+
+    def _custom(self, message: str, sp: str) -> Optional[str]:
+        """Call an OpenAI-compatible chat-completions endpoint."""
+        if not self.custom_api_url or not self.custom_api_model:
+            return None
+        messages = []
+        if sp:
+            messages.append({"role": "system", "content": sp})
+        messages.append({"role": "user", "content": message})
+        headers = {"Content-Type": "application/json"}
+        if self.custom_api_key:
+            headers["Authorization"] = f"Bearer {self.custom_api_key}"
+        try:
+            response = requests.post(
+                self.custom_api_url,
+                headers=headers,
+                json={"model": self.custom_api_model, "messages": messages,
+                      "max_tokens": self.max_tokens, "temperature": 0.7},
+                timeout=60,
+            )
+            if response.status_code == 200:
+                return response.json()["choices"][0]["message"]["content"]
+            return f"Ошибка API: {response.status_code} {response.text[:200]}"
+        except Exception as exc:
+            return f"Не удалось подключиться к API: {exc}"
 
     # -- OpenRouter (cloud) -------------------------------------------------
     def _openrouter(self, message: str, sp: str) -> Optional[str]:

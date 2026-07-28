@@ -17,7 +17,6 @@ import sys
 import os
 import json
 import threading
-import queue
 import time
 import re
 import webbrowser
@@ -31,8 +30,8 @@ import mediapipe as mp
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QCheckBox, QSlider, QLineEdit, QTextBrowser,
-    QFileDialog, QGroupBox, QFormLayout, QSpinBox, QDoubleSpinBox, QPlainTextEdit,
-    QProgressBar, QDialog, QRadioButton, QButtonGroup
+    QGroupBox, QFormLayout, QSpinBox, QDoubleSpinBox, QPlainTextEdit,
+    QProgressBar, QDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QFont

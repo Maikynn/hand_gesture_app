@@ -4,7 +4,6 @@ Settings Window for the Hand Gesture Application.
 Provides UI for camera selection, skeleton toggles, calibration, and model loading.
 """
 
-import os
 import json
 import logging
 from pathlib import Path

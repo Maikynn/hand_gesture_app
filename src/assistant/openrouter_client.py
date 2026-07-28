@@ -5,8 +5,7 @@ Handles communication with OpenRouter API for AI responses.
 """
 
 import requests
-import json
-from typing import Optional, Dict, Any
+from typing import Optional
 
 class OpenRouterClient:
     """

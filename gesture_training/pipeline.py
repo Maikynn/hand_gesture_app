@@ -15,11 +15,13 @@ import sys
 import numpy as np
 import pandas as pd
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT)
 
-from gesture_training.dynamic_model import (
-    DynamicLSTM, JESTER_DYNAMIC_CLASSES, SEQ_LEN, NUM_LM, LM_DIM,
+from gesture_training.dynamic_model import (  # noqa: E402
+    DynamicLSTM,
+    JESTER_DYNAMIC_CLASSES,
+    SEQ_LEN,
 )
 
 # ---------------------------------------------------------------------------
@@ -45,11 +47,14 @@ DYNAMIC_MODEL_PATH = os.path.join(MODELS_DIR, "dynamic_lstm.pth")
 # ---------------------------------------------------------------------------
 def _download_mediapipe_model():
     import urllib.request
+
     if not os.path.exists(MODEL_ASSET_PATH):
         print("Downloading MediaPipe Hand Landmarker model...")
         os.makedirs(os.path.dirname(MODEL_ASSET_PATH), exist_ok=True)
-        url = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
-               "hand_landmarker/float16/1/hand_landmarker.task")
+        url = (
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+            "hand_landmarker/float16/1/hand_landmarker.task"
+        )
         urllib.request.urlretrieve(url, MODEL_ASSET_PATH)
         print("Model downloaded.")
 
@@ -69,7 +74,9 @@ def _normalize_and_extract_features(landmarks_sequence):
         final[t, :, :3] = normalized
         if t > 0:
             final[t, :, 3:6] = final[t, :, :3] - final[t - 1, :, :3]
-    return final.reshape(seq_len, -1)
+    # DynamicLSTM consumes 21 * (x, y, z) = 63 features.  Velocities are kept
+    # available above for future architectures but must not be fed to this model.
+    return final[:, :, :3].reshape(seq_len, LANDMARK_COUNT * 3)
 
 
 def extract_jester():
@@ -81,32 +88,41 @@ def extract_jester():
     _download_mediapipe_model()
     base_options = python.BaseOptions(model_asset_path=MODEL_ASSET_PATH)
     options = vision.HandLandmarkerOptions(
-        base_options=base_options, num_hands=1, min_hand_detection_confidence=0.3)
+        base_options=base_options, num_hands=1, min_hand_detection_confidence=0.3
+    )
     detector = vision.HandLandmarker.create_from_options(options)
 
     for subset_name, csv_path in CSV_MAPPINGS.items():
         if not os.path.exists(csv_path):
             print(f"Skip {subset_name}: {csv_path} not found")
             continue
-        is_test = (subset_name == "test")
-        df = pd.read_csv(csv_path, sep=';',
-                         names=['folder_id', 'gesture_name'] if not is_test else ['folder_id'])
+        is_test = subset_name == "test"
+        df = pd.read_csv(
+            csv_path,
+            sep=";",
+            names=["folder_id", "gesture_name"] if not is_test else ["folder_id"],
+        )
         if is_test:
-            df['gesture_name'] = 'unlabeled'
+            df["gesture_name"] = "unlabeled"
 
-        unique_classes = sorted(df['gesture_name'].unique())
+        unique_classes = sorted(df["gesture_name"].unique())
         class_to_idx = {c: i for i, c in enumerate(unique_classes)}
         X_data, y_data = [], []
 
         print(f"\nProcessing MediaPipe for [{subset_name.upper()}]...")
         for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Extract {subset_name}"):
-            folder_id = str(row['folder_id']).strip()
-            label_idx = class_to_idx[row['gesture_name']]
+            folder_id = str(row["folder_id"]).strip()
+            label_idx = class_to_idx[row["gesture_name"]]
             video_path = os.path.join(JESTER_RAW_DIR, folder_id)
             if not os.path.exists(video_path):
                 continue
-            frame_files = sorted([f for f in os.listdir(video_path)
-                                  if f.lower().endswith(('.jpg', '.jpeg'))])
+            frame_files = sorted(
+                [
+                    f
+                    for f in os.listdir(video_path)
+                    if f.lower().endswith((".jpg", ".jpeg"))
+                ]
+            )
             if len(frame_files) < 5:
                 continue
             indices = np.linspace(0, len(frame_files) - 1, SEQ_LEN, dtype=int)
@@ -122,22 +138,29 @@ def extract_jester():
                     break
                 if results.hand_landmarks:
                     hand = results.hand_landmarks[0]
-                    coords = np.array([[lm.x, lm.y, lm.z] for lm in hand], dtype=np.float32)
+                    coords = np.array(
+                        [[lm.x, lm.y, lm.z] for lm in hand], dtype=np.float32
+                    )
                     clip_landmarks.append(coords)
                 else:
                     if clip_landmarks:
                         clip_landmarks.append(clip_landmarks[-1])
                     else:
-                        clip_landmarks.append(np.zeros((LANDMARK_COUNT, 3), dtype=np.float32))
+                        clip_landmarks.append(
+                            np.zeros((LANDMARK_COUNT, 3), dtype=np.float32)
+                        )
             if valid and clip_landmarks:
                 X_data.append(_normalize_and_extract_features(clip_landmarks))
                 y_data.append(label_idx)
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         out_file = os.path.join(OUTPUT_DIR, f"jester_{subset_name}.npz")
-        np.savez_compressed(out_file, X=np.array(X_data, dtype=np.float32),
-                            y=np.array(y_data, dtype=np.int64),
-                            classes=np.array(unique_classes))
+        np.savez_compressed(
+            out_file,
+            X=np.array(X_data, dtype=np.float32),
+            y=np.array(y_data, dtype=np.int64),
+            classes=np.array(unique_classes),
+        )
         print(f"Saved -> {out_file}")
 
     detector.close()
@@ -151,11 +174,12 @@ def _load_npz(subset):
     if not os.path.exists(path):
         return None, None, None
     data = np.load(path, allow_pickle=True)
-    return data['X'], data['y'], list(data['classes'])
+    return data["X"], data["y"], list(data["classes"])
 
 
 def train_dynamic(epochs=20, batch_size=32):
     import torch
+    import torch.nn as nn
     from torch.utils.data import TensorDataset, DataLoader
 
     X, y, classes = _load_npz("train")
@@ -163,8 +187,30 @@ def train_dynamic(epochs=20, batch_size=32):
         print("No training .npz found. Run extract_jester() first.")
         return
     # Map jester labels -> dynamic vocabulary (best-effort)
-    label_map = {c: c for c in JESTER_DYNAMIC_CLASSES}
-    y_mapped = np.array([label_map.get(classes[i], 0) for i in y], dtype=np.int64)
+    class_to_index = {name: index for index, name in enumerate(JESTER_DYNAMIC_CLASSES)}
+    jester_aliases = {
+        "pushing_hand_away": "push",
+        "pulling_hand_in": "pull",
+        "zooming_in_with_full_hand": "zoom_in",
+        "zooming_out_with_full_hand": "zoom_out",
+        "shaking_hand": "shaking",
+        "drumming_fingers": "drumming",
+        "no_gesture": "no_gesture",
+    }
+    normalized_classes = [
+        str(name).strip().casefold().replace("-", "_").replace(" ", "_")
+        for name in classes
+    ]
+    y_mapped = np.array(
+        [
+            class_to_index.get(
+                jester_aliases.get(normalized_classes[index], normalized_classes[index]),
+                0,
+            )
+            for index in y
+        ],
+        dtype=np.int64,
+    )
 
     Xt = torch.from_numpy(X).float()
     yt = torch.from_numpy(y_mapped).long()
@@ -188,7 +234,7 @@ def train_dynamic(epochs=20, batch_size=32):
             loss.backward()
             optimizer.step()
             total_loss += loss.item() * xb.size(0)
-        print(f"  epoch {epoch+1}/{epochs}  loss={total_loss/len(X):.4f}")
+        print(f"  epoch {epoch + 1}/{epochs}  loss={total_loss / len(X):.4f}")
 
     os.makedirs(MODELS_DIR, exist_ok=True)
     torch.save(model.state_dict(), DYNAMIC_MODEL_PATH)
@@ -200,5 +246,5 @@ def main():
     train_dynamic()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

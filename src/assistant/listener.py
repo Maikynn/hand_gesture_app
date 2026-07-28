@@ -7,26 +7,42 @@ recognition and wake-word detection.
 
 import os
 import json
-import queue
 import threading
 import time
 from typing import Optional, Callable
 
-# Try to import Vosk, fall back to speech_recognition if not available
+# Optional speech backends are detected independently.  A missing Vosk model
+# must still be able to fall back to SpeechRecognition.
 try:
     from vosk import Model, KaldiRecognizer
+
     VOSK_AVAILABLE = True
 except ImportError:
     VOSK_AVAILABLE = False
+
+try:
     import speech_recognition as sr
+
+    SR_AVAILABLE = True
+except ImportError:
+    sr = None
+    SR_AVAILABLE = False
+
 
 class WakeWordListener:
     """
     Listens for wake word and transcribes speech.
     """
-    def __init__(self, wake_word: str = "аксиос", model_path: str = "models/vosk-model-ru",
-                 stt_engine: str = "vosk", whisper_model: str = "bond005/whisper-podlodka-turbo",
-                 mic_index: Optional[int] = None, gain: float = 1.0):
+
+    def __init__(
+        self,
+        wake_word: str = "аксиос",
+        model_path: str = "models/vosk-model-ru",
+        stt_engine: str = "vosk",
+        whisper_model: str = "bond005/whisper-podlodka-turbo",
+        mic_index: Optional[int] = None,
+        gain: float = 1.0,
+    ):
         self.wake_word = wake_word.lower()
         self.model_path = model_path
         self.stt_engine = stt_engine.lower()
@@ -36,7 +52,9 @@ class WakeWordListener:
         self.is_listening = False
         self.callback = None
         self.thread = None
-        self.continuous_mode = False  # If True, process all speech; if False, only after wake word
+        self.continuous_mode = (
+            False  # If True, process all speech; if False, only after wake word
+        )
         self._whisper_stream = None
 
         if self.stt_engine == "whisper":
@@ -53,15 +71,25 @@ class WakeWordListener:
             print(f"Vosk model not found at {self.model_path}")
             print("Please download from https://alphacephei.com/vosk/models")
             self.vosk_model = None
+            self.setup_speech_recognition()
         else:
             self.vosk_model = Model(self.model_path)
 
     def setup_speech_recognition(self):
         """Setup speech_recognition as fallback."""
+        if not SR_AVAILABLE:
+            self.recognizer = None
+            self.microphone = None
+            return
         self.recognizer = sr.Recognizer()
-        self.microphone = sr.Microphone()
+        try:
+            self.microphone = sr.Microphone(device_index=self.mic_index)
+        except Exception:
+            self.microphone = None
 
-    def start_listening(self, callback: Callable[[str], None], continuous: bool = False):
+    def start_listening(
+        self, callback: Callable[[str], None], continuous: bool = False
+    ):
         """
         Start listening for wake word and speech.
 
@@ -69,6 +97,8 @@ class WakeWordListener:
             callback: Function to call with transcribed text (command after wake word)
             continuous: If True, process all speech; if False, only after wake word
         """
+        if self.is_listening:
+            return
         self.is_listening = True
         self.callback = callback
         self.continuous_mode = continuous
@@ -77,8 +107,14 @@ class WakeWordListener:
             self.thread = threading.Thread(target=self._listen_whisper)
         elif VOSK_AVAILABLE and self.vosk_model:
             self.thread = threading.Thread(target=self._listen_vosk)
-        else:
+        elif (
+            getattr(self, "recognizer", None) is not None
+            and getattr(self, "microphone", None) is not None
+        ):
             self.thread = threading.Thread(target=self._listen_sr)
+        else:
+            self.is_listening = False
+            raise RuntimeError("Не найден доступный модуль распознавания речи")
 
         self.thread.daemon = True
         self.thread.start()
@@ -100,8 +136,13 @@ class WakeWordListener:
         import pyaudio
 
         p = pyaudio.PyAudio()
-        stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000,
-                       input=True, frames_per_buffer=8000)
+        stream = p.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=16000,
+            input=True,
+            frames_per_buffer=8000,
+        )
         stream.start_stream()
 
         rec = KaldiRecognizer(self.vosk_model, 16000)
@@ -121,12 +162,16 @@ class WakeWordListener:
     def _listen_whisper(self):
         """Listen using the Whisper STT engine (bond005/whisper-podlodka-turbo)."""
         from assistant.whisper_stt import WhisperStream, whisper_available
+
         if not whisper_available():
             print("[WakeWordListener] Whisper unavailable, falling back to Vosk")
-            if VOSK_AVAILABLE and self.vosk_model:
+            if VOSK_AVAILABLE and getattr(self, "vosk_model", None):
                 self._listen_vosk()
-            else:
+            elif (getattr(self, "recognizer", None) is not None
+                  and getattr(self, "microphone", None) is not None):
                 self._listen_sr()
+            else:
+                self.is_listening = False
             return
 
         def on_final(text: str):
@@ -180,7 +225,7 @@ class WakeWordListener:
         if self.wake_word in text:
             # Extract command after wake word
             idx = text.find(self.wake_word)
-            command = text[idx + len(self.wake_word):].strip()
+            command = text[idx + len(self.wake_word) :].strip()
             # Only call callback if there's a command or in continuous mode
             if command:
                 if self.callback:
@@ -198,11 +243,12 @@ class WakeWordListener:
         try:
             if VOSK_AVAILABLE:
                 import pyaudio
+
                 p = pyaudio.PyAudio()
                 p.terminate()
                 return True
             else:
-                with self.microphone as source:
+                with self.microphone:
                     return True
         except Exception:
             return False
