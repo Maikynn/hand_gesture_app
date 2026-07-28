@@ -30,6 +30,19 @@ if errorlevel 1 exit /b 1
 "venv\Scripts\python.exe" -m pip install --no-deps ultralytics==8.4.102
 if errorlevel 1 exit /b 1
 
+if not exist "models\piper\ru_RU-denis-medium.onnx" (
+  echo Downloading the offline Russian Piper voice...
+  if not exist "models\piper" mkdir "models\piper"
+  "venv\Scripts\python.exe" -m piper.download_voices --download-dir "models\piper" ru_RU-denis-medium
+  if errorlevel 1 exit /b 1
+)
+
+if not exist "models\whisper\tiny\model.bin" (
+  echo Downloading the local Faster-Whisper tiny model...
+  "venv\Scripts\hf.exe" download Systran/faster-whisper-tiny --local-dir "models\whisper\tiny"
+  if errorlevel 1 exit /b 1
+)
+
 echo.
 echo [OK] Axi Control is ready. Start it with run.bat.
 endlocal

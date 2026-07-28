@@ -38,12 +38,16 @@ class ActionExecutor:
         app_launcher: Callable[[str], Any] | None = None,
         url_opener: Callable[[str], Any] | None = None,
         hotkey_sender: Callable[[List[str]], Any] | None = None,
+        scenarios: Iterable[Dict[str, Any]] | None = None,
     ):
         self._app_launcher = app_launcher or self._default_app_launcher
         self._url_opener = url_opener or webbrowser.open
         self._hotkey_sender = hotkey_sender or self._default_hotkey_sender
         self.permissions: List[Dict[str, Any]] = []
+        self.scenarios: Dict[str, Dict[str, Any]] = {}
+        self._undo_stack: List[Dict[str, Any]] = []
         self.set_permissions(permissions or [])
+        self.set_scenarios(scenarios or [])
 
     @staticmethod
     def _norm(path: str) -> str:
@@ -68,6 +72,13 @@ class ActionExecutor:
                 result[self._norm(path)] = item
         return result
 
+    def set_scenarios(self, scenarios: Iterable[Dict[str, Any]]) -> None:
+        self.scenarios = {
+            str(item.get("id", "")).strip(): dict(item)
+            for item in scenarios
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        }
+
     def validate(self, action: Dict[str, Any]) -> None:
         kind = str(action.get("type", "")).strip().lower()
         target = str(action.get("target", "")).strip()
@@ -90,9 +101,21 @@ class ActionExecutor:
         elif kind == "response":
             if not target:
                 raise ActionError("Для ответа нужен текст")
+        elif kind == "scenario":
+            scenario = self.scenarios.get(target)
+            if not scenario:
+                raise ActionError("Сценарий не найден")
+            steps = scenario.get("steps", [])
+            if not isinstance(steps, list) or not steps:
+                raise ActionError("В сценарии нет шагов")
+            for step in steps:
+                if not isinstance(step, dict) or str(step.get("type", "")).lower() == "scenario":
+                    raise ActionError("Вложенные сценарии не поддерживаются")
+                self.validate(step)
         else:
             raise ActionError(
-                "Поддерживаются: приложение, ссылка, горячая клавиша, системное действие, ответ"
+                "Поддерживаются: приложение, ссылка, горячая клавиша, "
+                "системное действие, сценарий, ответ"
             )
 
     def execute(self, action: Dict[str, Any]) -> str:
@@ -118,7 +141,21 @@ class ActionExecutor:
             return f"Выполняю {target}"
         if kind == "response":
             return target
+        if kind == "scenario":
+            scenario = self.scenarios[target]
+            messages = [self.execute(step) for step in scenario.get("steps", [])]
+            return str(scenario.get("reply") or " · ".join(messages))
         self._execute_system(target)
+        inverse = {
+            "volume_up": "volume_down",
+            "volume_down": "volume_up",
+            "volume_mute": "volume_mute",
+            "play_pause": "play_pause",
+            "show_desktop": "show_desktop",
+        }.get(target)
+        if inverse:
+            self._undo_stack.append({"type": "system", "target": inverse})
+            self._undo_stack = self._undo_stack[-20:]
         labels = {
             "volume_up": "Делаю громче",
             "volume_down": "Делаю тише",
@@ -131,6 +168,13 @@ class ActionExecutor:
             "lock": "Блокирую компьютер",
         }
         return labels[target]
+
+    def undo_last(self) -> str:
+        if not self._undo_stack:
+            raise ActionError("Нет обратимого действия для отмены")
+        action = self._undo_stack.pop()
+        self._execute_system(str(action["target"]))
+        return "Последнее обратимое действие отменено"
 
     @staticmethod
     def _parse_hotkey(value: str) -> List[str]:
@@ -179,6 +223,7 @@ ACTION_LABELS = {
     "url": "Ссылка",
     "hotkey": "Горячая клавиша",
     "system": "Системное действие",
+    "scenario": "Сценарий",
     "response": "Только ответ",
 }
 

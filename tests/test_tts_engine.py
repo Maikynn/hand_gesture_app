@@ -76,6 +76,32 @@ class TTSEngineTests(unittest.TestCase):
         self.assertTrue(tts._is_cancelled(old_request.generation))
         self.assertFalse(tts._is_cancelled(new_request.generation))
 
+    @patch("threading.Thread.start")
+    def test_piper_never_silently_becomes_windows_voice(self, _start):
+        events = []
+        tts = TTSEngine(
+            engine="piper",
+            fallback_engine="none",
+            on_event=lambda state, message: events.append((state, message)),
+        )
+        request = SpeechRequest(
+            text="Проверка",
+            generation=0,
+            engine="piper",
+            voice_id="ru_RU-denis-medium",
+            rate=175,
+            volume=0.9,
+            pitch=0,
+            fallback_engine="none",
+        )
+        with (
+            patch.object(tts, "_speak_piper", side_effect=RuntimeError("broken")),
+            patch.object(tts, "_speak_offline") as offline,
+        ):
+            tts._speak(request)
+        offline.assert_not_called()
+        self.assertTrue(any(state == "error" for state, _ in events))
+
 
 if __name__ == "__main__":
     unittest.main()

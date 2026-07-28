@@ -46,3 +46,21 @@ The optional HaGRID neural gesture backend uses the separately installed
 Ultralytics is distributed under AGPL-3.0 unless covered by a separate
 enterprise license. The bundled `models/yolo/hagrid_best.pt` contains the
 project's trained gesture weights and is loaded only when YOLO is selected.
+
+## Piper neural speech
+
+The optional local neural speech backend uses
+[OHF-Voice Piper](https://github.com/OHF-Voice/piper1-gpl) 1.6.0, distributed
+under GPL-3.0-or-later. `setup_venv.bat` downloads the Russian
+`ru_RU-denis-medium` voice from the public
+[Piper voices collection](https://huggingface.co/rhasspy/piper-voices). The
+model is installed locally and is intentionally not committed to this
+repository.
+
+## Faster-Whisper
+
+Local neural speech recognition uses
+[SYSTRAN Faster-Whisper](https://github.com/SYSTRAN/faster-whisper) 1.2.1 and
+CTranslate2 4.8.1, both distributed under the MIT license. The `tiny`
+multilingual model is downloaded during setup into the Git-ignored
+`models/whisper` directory.

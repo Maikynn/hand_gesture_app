@@ -39,8 +39,8 @@ except Exception:  # pragma: no cover
     _PYAUDIO_OK = False
 
 
-# Russian podcast/turbo model from HuggingFace (user-requested).
-DEFAULT_MODEL = "bond005/whisper-podlodka-turbo"
+# Small multilingual model: downloads on first selection and then runs offline.
+DEFAULT_MODEL = "tiny"
 
 
 def whisper_available() -> bool:

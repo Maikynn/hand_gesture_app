@@ -13,3 +13,6 @@ __pycache__/
 dist/
 build/
 *.spec.local
+user_data/
+models/piper/
+models/whisper/

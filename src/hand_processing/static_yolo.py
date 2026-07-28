@@ -33,9 +33,12 @@ DEFAULT_YOLO_MODEL = str(
 
 
 class YOLOStaticModel:
-    def __init__(self, model_path: str, classes: list):
+    def __init__(self, model_path: str, classes: list, device: str = "auto"):
         self.model_path = model_path
         self.classes = list(classes)
+        self.requested_device = device if device in {"auto", "cpu", "cuda"} else "auto"
+        self.device = "cpu"
+        self.fallback_reason = ""
         self._class_to_idx = {c: i for i, c in enumerate(self.classes)}
         self._model = None
         self._loaded = False  # True once ensure_loaded has run at least once
@@ -104,6 +107,19 @@ class YOLOStaticModel:
             return False
         try:
             self._model = YOLO(resolved)
+            try:
+                import torch
+
+                if self.requested_device == "cuda" and not torch.cuda.is_available():
+                    self.fallback_reason = "CUDA недоступна — используется CPU"
+                self.device = (
+                    "cuda"
+                    if self.requested_device in {"auto", "cuda"}
+                    and torch.cuda.is_available()
+                    else "cpu"
+                )
+            except Exception:
+                self.device = "cpu"
             print(f"[YOLOStaticModel] loaded: {resolved}")
             return True
         except Exception as e:
@@ -117,7 +133,7 @@ class YOLOStaticModel:
 
     def status(self) -> str:
         if self._model is not None:
-            return f"loaded:{self._resolved_path}"
+            return f"loaded:{self._resolved_path}:{self.device}"
         if self._loaded:
             return "not_trained"
         return "pending"
@@ -142,10 +158,19 @@ class YOLOStaticModel:
             else cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
         )
         try:
-            results = self._model(crop_rgb, verbose=False)
+            results = self._model(crop_rgb, verbose=False, device=self.device)
         except Exception as e:
-            print(f"[YOLOStaticModel] inference error: {e}")
-            return None
+            if self.device == "cuda":
+                self.fallback_reason = f"CUDA inference failed: {e}"
+                self.device = "cpu"
+                try:
+                    results = self._model(crop_rgb, verbose=False, device="cpu")
+                except Exception as cpu_error:
+                    print(f"[YOLOStaticModel] inference error: {cpu_error}")
+                    return None
+            else:
+                print(f"[YOLOStaticModel] inference error: {e}")
+                return None
         res = results[0]
         probs = np.zeros(len(self.classes), dtype=np.float32)
         names = self._model.names  # dict idx -> class name

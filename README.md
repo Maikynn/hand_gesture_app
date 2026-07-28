@@ -33,6 +33,14 @@ The camera page provides:
 - optional built-in or user-selected ONNX/TFLite models;
 - bundled YOLO HaGRID model with a selectable `.pt` path;
 - stable-frame filtering and one action per held gesture;
+- a personal hand calibration wizard and in-app custom-gesture recording;
+- gesture sequences such as `fist → palm → two_up`;
+- Work, Games, Music, and Presentation control profiles;
+- configurable recognition ROI and automatic light/contrast/white balance;
+- an on-video HUD with FPS, confidence, latency, cooldown, model and device;
+- YOLO CUDA acceleration with automatic CPU fallback;
+- hold time and optional second-gesture confirmation against accidental actions;
+- a persistent history where wrong recognitions can be marked for retraining;
 - safe mode: gesture actions stay off until explicitly enabled;
 - application, URL, hotkey, and safe built-in system actions.
 
@@ -45,14 +53,21 @@ The assistant page contains:
 
 - text chat and microphone control;
 - multiple wake phrases separated by commas;
-- offline Vosk or online Google speech recognition;
+- offline Vosk, local Faster-Whisper, or online Google speech recognition;
 - editable command phrases with fuzzy matching;
 - a strict allowlist for executable files;
 - original Priler/Jarvis Russian reaction sounds;
-- a deep Microsoft neural Russian voice with speed, pitch, and volume controls;
-- automatic offline Windows voice fallback when the network is unavailable;
+- local Piper Neural Russian speech (`Денис`) that stays offline after setup;
+- optional Edge Neural and explicitly separate Windows SAPI speech;
+- no silent Microsoft SAPI substitution: the fallback is a visible user choice;
+- calm, strict, and emotional voice profiles plus sentence-level streaming TTS;
+- barge-in: microphone speech and Push-to-Talk interrupt current playback;
 - visible synthesis/playback/fallback/error status and repeat-safe voice tests;
 - OpenRouter, local Ollama, or any OpenAI-compatible API;
+- inspectable/deletable long-term memory and multi-step action scenarios;
+- confirmation levels for important commands and `отмени последнее`;
+- system tray operation and a global `Ctrl+Alt+J` Push-to-Talk hotkey;
+- a diagnostics panel for microphone, STT, TTS, LLM and latency;
 - configurable humorous fallback phrases when no model is available.
 
 API keys and every choice made in the interface are never written to tracked
@@ -76,9 +91,9 @@ src/
   assistant/
     actions.py           safe action executor
     embedded_jarvis.py   command router and Priler voice reactions
-    listener.py          Vosk/Google wake-word listener
+    listener.py          Vosk/Whisper/Google wake-word listener
     llm_client.py        OpenRouter/Ollama/custom API routing
-  camera/                camera and MediaPipe tracking
+  camera/                camera, MediaPipe and advanced gesture features
   hand_processing/       gesture recognition and optional models
   ui/
     main_window.py       shell, camera page, gesture bindings
@@ -89,6 +104,10 @@ third_party/priler_jarvis/
   original source and voice/command resources
 models/vosk-ru/
   offline Russian speech-recognition model
+models/piper/
+  downloaded local neural voice (ignored by Git)
+models/whisper/
+  downloaded Faster-Whisper model (ignored by Git)
 ```
 
 ## Tests

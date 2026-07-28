@@ -18,18 +18,31 @@
     "yolo_inference_interval_ms": 180,
     "stable_frames": 3,
     "release_frames": 3,
-    "actions_enabled": false
+    "actions_enabled": false,
+    "active_profile": "work",
+    "auto_enhance": false,
+    "hud_enabled": true,
+    "roi_enabled": false,
+    "roi": [0.08, 0.08, 0.84, 0.84],
+    "inference_device": "auto",
+    "hold_ms": 450,
+    "confirmation_gesture_enabled": false,
+    "confirmation_gesture": "ok",
+    "calibration_scale": 1.0
   },
   "assistant": {
     "wake_phrases": "джарвис, аксиос",
     "stt_engine": "vosk",
+    "whisper_model": "tiny",
     "vosk_model_path": "models/vosk-ru",
     "microphone_index": -1,
     "microphone_gain": 1.0,
     "continuous_listening": false,
     "tts_enabled": true,
-    "tts_engine": "edge",
-    "tts_voice": "ru-RU-DmitryNeural",
+    "tts_engine": "piper",
+    "tts_voice": "ru_RU-denis-medium",
+    "tts_fallback_engine": "none",
+    "tts_profile": "calm",
     "tts_rate": 175,
     "tts_pitch": -12,
     "tts_volume": 0.9,
@@ -46,6 +59,9 @@
     "system_prompt": "Ты — встроенный голосовой помощник Jarvis. Отвечай кратко, дружелюбно и по-русски. Не утверждай, что выполнил действие, если оно не было выполнено приложением.",
     "max_tokens": 350,
     "command_match_threshold": 66,
+    "confirmation_level": "dangerous",
+    "close_to_tray": true,
+    "push_to_talk_hotkey": "ctrl+alt+j",
     "error_phrases": [
       "Похоже, мои нейроны ушли на перекур. Настрой модель — и попробуем снова.",
       "Я бы с радостью ответил, но цифровые тараканы перегрызли провод к модели.",
@@ -219,8 +235,48 @@
       "target": "Почему программист перепутал Хэллоуин и Рождество? Потому что OCT 31 равняется DEC 25.",
       "reply": "Почему программист перепутал Хэллоуин и Рождество? Потому что OCT 31 равняется DEC 25.",
       "enabled": true
+    },
+    {
+      "id": "focus_mode",
+      "phrases": [
+        "включи режим фокуса",
+        "режим фокуса",
+        "мне нужно сосредоточиться"
+      ],
+      "type": "scenario",
+      "target": "focus_mode",
+      "reply": "Включаю режим фокуса",
+      "enabled": true
     }
   ],
+  "scenarios": [
+    {
+      "id": "focus_mode",
+      "name": "Режим фокуса",
+      "reply": "Режим фокуса включён",
+      "steps": [
+        {"type": "system", "target": "volume_mute"},
+        {"type": "application", "target": "C:\\Windows\\System32\\notepad.exe"}
+      ]
+    }
+  ],
+  "gesture_sequences": [
+    {
+      "id": "quick_screenshot",
+      "name": "Быстрый скриншот",
+      "steps": ["fist", "palm", "two_up"],
+      "timeout_sec": 3.0,
+      "type": "system",
+      "target": "screenshot",
+      "enabled": false
+    }
+  ],
+  "camera_profiles": {
+    "work": {"name": "Работа", "stable_frames": 3, "inference_interval_ms": 100},
+    "games": {"name": "Игры", "stable_frames": 2, "inference_interval_ms": 60},
+    "music": {"name": "Музыка", "stable_frames": 3, "inference_interval_ms": 90},
+    "presentation": {"name": "Презентация", "stable_frames": 4, "inference_interval_ms": 120}
+  },
   "gesture_bindings": [
     {
       "gesture": "palm",

@@ -13,27 +13,38 @@ import numpy as np
 # make _framework_bindings fail or crash later inside MSVCP140.dll.
 from camera.skeleton_renderer import SkeletonRenderer
 
+# Preload Piper/ONNX before Qt widgets for stable native DLL initialization.
+from assistant import tts_engine as _tts_runtime  # noqa: F401
+from faster_whisper import WhisperModel as _whisper_runtime  # noqa: F401
+
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QKeySequence, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QAction,
     QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QShortcut,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QStackedWidget,
+    QStyle,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -41,6 +52,14 @@ from PyQt5.QtWidgets import (
 )
 
 from assistant.actions import ACTION_LABELS, ActionExecutor
+from camera.advanced_features import (
+    CustomGestureLibrary,
+    GestureHistory,
+    GestureSequenceMatcher,
+    apply_roi_mask,
+    auto_enhance,
+    normalized_landmarks,
+)
 from camera.video_capture import VideoCapture
 from hand_processing.gesture_recognizer import GestureRecognizer
 from hand_processing.gesture_fusion import HAGRID_CLASSES
@@ -48,6 +67,7 @@ from hand_processing.static_yolo import DEFAULT_YOLO_MODEL, YOLOStaticModel
 from ui.assistant_window import AssistantWindow
 from ui.theme import apply_theme
 from utils.config_store import ConfigStore
+from utils.global_hotkey import GlobalHotkey
 from utils.logger import setup_logger
 from utils.model_manager import ModelManager
 
@@ -183,6 +203,11 @@ class GestureBindingsPanel(QFrame):
         for binding in store.get("gesture_bindings", []):
             self.add_row(binding)
 
+    def load_bindings(self, bindings: List[Dict[str, Any]]) -> None:
+        self.table.setRowCount(0)
+        for binding in bindings:
+            self.add_row(binding)
+
     @staticmethod
     def _combo(value_map: Dict[str, str], selected: str) -> QComboBox:
         combo = QComboBox()
@@ -287,6 +312,14 @@ class CameraWidget(QWidget):
         self._model_loading = False
         self.executor = ActionExecutor(self.store.get("permissions", []))
         self.bindings = list(self.store.get("gesture_bindings", []))
+        self.custom_gestures = CustomGestureLibrary()
+        for custom_name in self.custom_gestures.names():
+            if custom_name not in GESTURES:
+                GESTURES.append(custom_name)
+        self.history = GestureHistory()
+        self.sequence_matcher = GestureSequenceMatcher(
+            self.store.get("gesture_sequences", [])
+        )
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.process_frame)
         self._last_inference = 0.0
@@ -296,10 +329,31 @@ class CameraWidget(QWidget):
         self._frame_times: List[float] = []
         self._last_hand_count = 0
         self._hand_state: Dict[str, Dict[str, Any]] = {
-            "Left": {"gesture": "", "count": 0, "fired": False},
-            "Right": {"gesture": "", "count": 0, "fired": False},
+            "Left": {
+                "gesture": "",
+                "count": 0,
+                "fired": False,
+                "first_seen": 0.0,
+                "logged": False,
+            },
+            "Right": {
+                "gesture": "",
+                "count": 0,
+                "fired": False,
+                "first_seen": 0.0,
+                "logged": False,
+            },
         }
         self._last_action: Dict[Tuple[str, str], float] = {}
+        self._last_inference_ms = 0.0
+        self._last_confidence = 0.0
+        self._last_gesture = "none"
+        self._last_cooldown_ms = 0
+        self._pending_gesture_action: Optional[Tuple[Dict[str, Any], str, float]] = None
+        self._recording_name = ""
+        self._recording_side = ""
+        self._recording_samples: List[List[float]] = []
+        self._calibration_samples: Optional[List[float]] = None
         self._build_ui()
         self.store.changed.connect(self._store_changed)
         if self.model_combo.currentData() == "yolo":
@@ -365,9 +419,11 @@ class CameraWidget(QWidget):
         hands.addWidget(self.right_hand)
         layout.addLayout(hands)
         layout.addWidget(self._controls())
+        layout.addWidget(self._advanced_controls())
         self.bindings_panel = GestureBindingsPanel(self.store, self.executor)
         self.bindings_panel.saved.connect(self._reload_bindings)
         layout.addWidget(self.bindings_panel)
+        layout.addWidget(self._history_panel())
         scroll.setWidget(body)
         root.addWidget(scroll)
 
@@ -441,6 +497,367 @@ class CameraWidget(QWidget):
         row.addLayout(toggles, 1)
         return card
 
+    def _advanced_controls(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("Card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 16, 16, 16)
+        title = QLabel("Точная настройка и обучение")
+        title.setStyleSheet("font-size: 13pt; font-weight: 700;")
+        layout.addWidget(title)
+
+        columns = QHBoxLayout()
+        form = QFormLayout()
+        self.profile_combo = QComboBox()
+        profiles = self.store.get("camera_profiles", {}) or {}
+        for profile_id, profile in profiles.items():
+            self.profile_combo.addItem(str(profile.get("name", profile_id)), profile_id)
+        self._set_combo_value(
+            self.profile_combo, self.settings.get("active_profile", "work")
+        )
+        self.profile_combo.currentIndexChanged.connect(self._change_profile)
+        save_profile = QPushButton("Сохранить текущие параметры в профиль")
+        save_profile.setProperty("secondary", True)
+        save_profile.clicked.connect(self._save_profile)
+        form.addRow("Профиль", self.profile_combo)
+        form.addRow("", save_profile)
+
+        self.inference_device = QComboBox()
+        self.inference_device.addItem("Авто: GPU → CPU", "auto")
+        self.inference_device.addItem("Только CPU", "cpu")
+        self.inference_device.addItem("NVIDIA CUDA", "cuda")
+        self._set_combo_value(
+            self.inference_device, self.settings.get("inference_device", "auto")
+        )
+        self.inference_device.currentIndexChanged.connect(self._save_advanced_controls)
+        form.addRow("Ускорение YOLO", self.inference_device)
+
+        self.hold_ms = QSpinBox()
+        self.hold_ms.setRange(0, 3000)
+        self.hold_ms.setSingleStep(100)
+        self.hold_ms.setSuffix(" мс")
+        self.hold_ms.setValue(int(self.settings.get("hold_ms", 450)))
+        self.hold_ms.valueChanged.connect(self._save_advanced_controls)
+        form.addRow("Удержание жеста", self.hold_ms)
+        columns.addLayout(form, 2)
+
+        options = QVBoxLayout()
+        self.auto_enhance_check = QCheckBox("Автояркость, контраст и баланс белого")
+        self.hud_check = QCheckBox("Подробный HUD поверх видео")
+        self.roi_check = QCheckBox("Распознавать только внутри ROI")
+        self.confirm_gesture_check = QCheckBox("Подтверждать действие вторым жестом")
+        self.auto_enhance_check.setChecked(bool(self.settings.get("auto_enhance", False)))
+        self.hud_check.setChecked(bool(self.settings.get("hud_enabled", True)))
+        self.roi_check.setChecked(bool(self.settings.get("roi_enabled", False)))
+        self.confirm_gesture_check.setChecked(
+            bool(self.settings.get("confirmation_gesture_enabled", False))
+        )
+        for option in (
+            self.auto_enhance_check,
+            self.hud_check,
+            self.roi_check,
+            self.confirm_gesture_check,
+        ):
+            option.toggled.connect(self._save_advanced_controls)
+            options.addWidget(option)
+        self.confirm_gesture_combo = QComboBox()
+        for gesture in GESTURES:
+            self.confirm_gesture_combo.addItem(
+                GESTURE_LABELS.get(gesture, gesture), gesture
+            )
+        self._set_combo_value(
+            self.confirm_gesture_combo,
+            self.settings.get("confirmation_gesture", "ok"),
+        )
+        self.confirm_gesture_combo.currentIndexChanged.connect(
+            self._save_advanced_controls
+        )
+        options.addWidget(self.confirm_gesture_combo)
+        columns.addLayout(options, 2)
+
+        roi_form = QFormLayout()
+        roi = list(self.settings.get("roi", [0.08, 0.08, 0.84, 0.84]))
+        self.roi_sliders: List[QSlider] = []
+        for label, value in zip(("ROI X", "ROI Y", "ROI ширина", "ROI высота"), roi):
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(0, 100)
+            slider.setValue(round(float(value) * 100))
+            slider.valueChanged.connect(self._save_advanced_controls)
+            self.roi_sliders.append(slider)
+            roi_form.addRow(label, slider)
+        columns.addLayout(roi_form, 2)
+        layout.addLayout(columns)
+
+        tools = QHBoxLayout()
+        calibrate = QPushButton("Калибровать руки")
+        calibrate.setProperty("secondary", True)
+        calibrate.clicked.connect(self._start_calibration)
+        record = QPushButton("Записать свой жест")
+        record.setProperty("secondary", True)
+        record.clicked.connect(self._start_custom_recording)
+        self.sequence_steps = QLineEdit()
+        self.sequence_steps.setPlaceholderText("fist > palm > two_up")
+        add_sequence = QPushButton("+ Последовательность")
+        add_sequence.setProperty("secondary", True)
+        add_sequence.clicked.connect(self._add_sequence)
+        tools.addWidget(calibrate)
+        tools.addWidget(record)
+        tools.addWidget(self.sequence_steps, 1)
+        tools.addWidget(add_sequence)
+        layout.addLayout(tools)
+        self.sequences_table = QTableWidget(0, 3)
+        self.sequences_table.setHorizontalHeaderLabels(
+            ["Последовательность", "Действие", "Пауза"]
+        )
+        self.sequences_table.horizontalHeader().setStretchLastSection(True)
+        self.sequences_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.sequences_table.setMaximumHeight(135)
+        layout.addWidget(self.sequences_table)
+        sequence_buttons = QHBoxLayout()
+        remove_sequence = QPushButton("Удалить выбранную последовательность")
+        remove_sequence.setProperty("danger", True)
+        remove_sequence.clicked.connect(self._remove_sequence)
+        sequence_buttons.addWidget(remove_sequence)
+        sequence_buttons.addStretch(1)
+        layout.addLayout(sequence_buttons)
+        self._refresh_sequences()
+        return card
+
+    def _history_panel(self) -> QGroupBox:
+        group = QGroupBox("История распознавания и исправления")
+        layout = QVBoxLayout(group)
+        self.history_table = QTableWidget(0, 6)
+        self.history_table.setHorizontalHeaderLabels(
+            ["Время", "Рука", "Жест", "Уверенность", "Модель", "Результат"]
+        )
+        self.history_table.horizontalHeader().setStretchLastSection(True)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.history_table.setMaximumHeight(190)
+        layout.addWidget(self.history_table)
+        row = QHBoxLayout()
+        incorrect = QPushButton("Отметить ошибкой")
+        incorrect.setProperty("danger", True)
+        incorrect.clicked.connect(self._mark_history_incorrect)
+        refresh = QPushButton("Обновить")
+        refresh.setProperty("secondary", True)
+        refresh.clicked.connect(self._refresh_history)
+        row.addWidget(incorrect)
+        row.addWidget(refresh)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self._refresh_history()
+        return group
+
+    @staticmethod
+    def _set_combo_value(combo: QComboBox, value: Any) -> None:
+        index = combo.findData(value)
+        combo.setCurrentIndex(max(0, index))
+
+    def _save_advanced_controls(self, *_args) -> None:
+        if not hasattr(self, "roi_sliders"):
+            return
+        selected_device = str(self.inference_device.currentData())
+        reload_yolo = (
+            self.yolo_model is not None
+            and self.yolo_model.requested_device != selected_device
+        )
+        roi = [slider.value() / 100.0 for slider in self.roi_sliders]
+        # Keep the rectangle usable even when sliders are dragged to zero.
+        roi[2] = max(0.1, min(roi[2], 1.0 - roi[0]))
+        roi[3] = max(0.1, min(roi[3], 1.0 - roi[1]))
+        self.store.update_many(
+            {
+                "camera.auto_enhance": self.auto_enhance_check.isChecked(),
+                "camera.hud_enabled": self.hud_check.isChecked(),
+                "camera.roi_enabled": self.roi_check.isChecked(),
+                "camera.roi": roi,
+                "camera.inference_device": selected_device,
+                "camera.hold_ms": self.hold_ms.value(),
+                "camera.confirmation_gesture_enabled": (
+                    self.confirm_gesture_check.isChecked()
+                ),
+                "camera.confirmation_gesture": str(
+                    self.confirm_gesture_combo.currentData()
+                ),
+            }
+        )
+        if reload_yolo:
+            self.yolo_model = None
+            QTimer.singleShot(0, self._change_model)
+
+    def _change_profile(self, *_args) -> None:
+        profile_id = str(self.profile_combo.currentData() or "work")
+        profile = (self.store.get("camera_profiles", {}) or {}).get(profile_id, {})
+        values = {"camera.active_profile": profile_id}
+        for key in ("stable_frames", "inference_interval_ms", "hold_ms"):
+            if key in profile:
+                values[f"camera.{key}"] = profile[key]
+        self.store.update_many(values)
+        if isinstance(profile.get("bindings"), list):
+            self.store.replace_section("gesture_bindings", profile["bindings"])
+            if hasattr(self, "bindings_panel"):
+                self.bindings_panel.load_bindings(profile["bindings"])
+        if "hold_ms" in profile:
+            self.hold_ms.setValue(int(profile["hold_ms"]))
+        self._set_camera_status("good", f"Профиль «{self.profile_combo.currentText()}» применён")
+
+    def _save_profile(self) -> None:
+        profile_id = str(self.profile_combo.currentData() or "work")
+        profiles = self.store.get("camera_profiles", {}) or {}
+        profile = dict(profiles.get(profile_id, {}))
+        profile.update(
+            {
+                "name": self.profile_combo.currentText(),
+                "stable_frames": int(self.store.get("camera.stable_frames", 3)),
+                "inference_interval_ms": int(
+                    self.store.get("camera.inference_interval_ms", 100)
+                ),
+                "hold_ms": self.hold_ms.value(),
+                "bindings": self.bindings_panel.values()
+                if hasattr(self, "bindings_panel")
+                else self.bindings,
+            }
+        )
+        profiles[profile_id] = profile
+        self.store.replace_section("camera_profiles", profiles)
+        self._set_camera_status("good", "Профиль обновлён")
+
+    def _start_calibration(self) -> None:
+        self._calibration_samples = []
+        self._set_camera_status(
+            "warn", "Калибровка: держи открытую ладонь в рабочем положении"
+        )
+
+    def _start_custom_recording(self) -> None:
+        name, accepted = QInputDialog.getText(
+            self, "Новый жест", "Название пользовательского жеста:"
+        )
+        if not accepted or not name.strip():
+            return
+        self._recording_name = " ".join(name.strip().lower().split())
+        self._recording_side = ""
+        self._recording_samples = []
+        self._set_camera_status(
+            "warn", f"Запись «{self._recording_name}»: покажи жест, нужно 30 кадров"
+        )
+
+    def _add_sequence(self) -> None:
+        steps = [
+            value.strip().lower()
+            for value in self.sequence_steps.text().replace("→", ">").split(">")
+            if value.strip()
+        ]
+        if len(steps) < 2:
+            QMessageBox.warning(
+                self, "Последовательность", "Укажи минимум два жеста через >"
+            )
+            return
+        labels = list(ACTION_LABELS.values())
+        label, accepted = QInputDialog.getItem(
+            self, "Действие последовательности", "Тип действия:", labels, 3, False
+        )
+        if not accepted:
+            return
+        kind = next(key for key, value in ACTION_LABELS.items() if value == label)
+        if kind == "system":
+            targets = sorted(ActionExecutor.SYSTEM_ACTIONS)
+            target, accepted = QInputDialog.getItem(
+                self, "Системное действие", "Действие:", targets, 0, False
+            )
+        else:
+            target, accepted = QInputDialog.getText(
+                self, "Цель действия", "Полный путь, URL, сочетание или текст:"
+            )
+        if not accepted or not str(target).strip():
+            return
+        action = {"type": kind, "target": str(target).strip()}
+        try:
+            self.executor.validate(action)
+        except Exception as exc:
+            QMessageBox.warning(self, "Действие не добавлено", str(exc))
+            return
+        sequences = list(self.store.get("gesture_sequences", []))
+        sequences.append(
+            {
+                "id": f"sequence_{int(time.time())}",
+                "name": " → ".join(steps),
+                "steps": steps,
+                "timeout_sec": 3.0,
+                "enabled": True,
+                **action,
+            }
+        )
+        self.store.replace_section("gesture_sequences", sequences)
+        self.sequence_matcher.configure(sequences)
+        self.sequence_steps.clear()
+        self._refresh_sequences()
+        self._set_camera_status("good", "Последовательность добавлена и активна")
+
+    def _refresh_sequences(self) -> None:
+        if not hasattr(self, "sequences_table"):
+            return
+        self.sequences_table.setRowCount(0)
+        for index, sequence in enumerate(self.store.get("gesture_sequences", [])):
+            row = self.sequences_table.rowCount()
+            self.sequences_table.insertRow(row)
+            values = (
+                " → ".join(str(step) for step in sequence.get("steps", [])),
+                f"{sequence.get('type', '')}: {sequence.get('target', '')}",
+                f"{float(sequence.get('timeout_sec', 3.0)):.1f} с",
+            )
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value))
+                cell.setData(Qt.UserRole, index)
+                self.sequences_table.setItem(row, column, cell)
+
+    def _remove_sequence(self) -> None:
+        rows = {index.row() for index in self.sequences_table.selectedIndexes()}
+        remove_indexes = set()
+        for row in rows:
+            cell = self.sequences_table.item(row, 0)
+            if cell is not None:
+                remove_indexes.add(int(cell.data(Qt.UserRole)))
+        sequences = [
+            sequence
+            for index, sequence in enumerate(self.store.get("gesture_sequences", []))
+            if index not in remove_indexes
+        ]
+        self.store.replace_section("gesture_sequences", sequences)
+        self.sequence_matcher.configure(sequences)
+        self._refresh_sequences()
+
+    def _refresh_history(self) -> None:
+        if not hasattr(self, "history_table"):
+            return
+        self.history_table.setRowCount(0)
+        start = max(0, len(self.history.items) - 50)
+        for index, item in enumerate(self.history.items[start:], start=start):
+            row = self.history_table.rowCount()
+            self.history_table.insertRow(row)
+            values = (
+                time.strftime("%H:%M:%S", time.localtime(item.timestamp)),
+                item.side,
+                item.gesture,
+                f"{item.confidence:.0%}",
+                item.model,
+                "ошибка" if item.incorrect else (item.action or "распознано"),
+            )
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value))
+                cell.setData(Qt.UserRole, index)
+                self.history_table.setItem(row, column, cell)
+
+    def _mark_history_incorrect(self) -> None:
+        rows = {index.row() for index in self.history_table.selectedIndexes()}
+        for row in rows:
+            cell = self.history_table.item(row, 0)
+            if cell is not None:
+                self.history.mark_incorrect(int(cell.data(Qt.UserRole)), True)
+        self._refresh_history()
+        self._set_camera_status(
+            "good", "Ошибка сохранена — запись готова для будущего переобучения"
+        )
+
     def start(self) -> None:
         if not self.timer.isActive():
             self.timer.start(33)
@@ -453,7 +870,15 @@ class CameraWidget(QWidget):
         self.store.set("camera.actions_enabled", enabled)
         if not enabled:
             for state in self._hand_state.values():
-                state.update({"gesture": "", "count": 0, "fired": False})
+                state.update(
+                    {
+                        "gesture": "",
+                        "count": 0,
+                        "fired": False,
+                        "first_seen": 0.0,
+                        "logged": False,
+                    }
+                )
         self._set_camera_status(
             "good" if enabled else "warn",
             "Жестовые действия включены" if enabled else "Безопасный режим: действия выключены",
@@ -551,7 +976,12 @@ class CameraWidget(QWidget):
             self._model_loading = True
             self._set_camera_status("warn", "Загружаю YOLO HaGRID…")
             try:
-                candidate = YOLOStaticModel(path, HAGRID_CLASSES)
+                device = (
+                    str(self.inference_device.currentData())
+                    if hasattr(self, "inference_device")
+                    else str(self.store.get("camera.inference_device", "auto"))
+                )
+                candidate = YOLOStaticModel(path, HAGRID_CLASSES, device=device)
                 if candidate.ensure_loaded():
                     self.yolo_model = candidate
                     self.recognizer.has_model = False
@@ -597,6 +1027,9 @@ class CameraWidget(QWidget):
             self.executor.set_permissions(self.store.get("permissions", []))
         elif key == "gesture_bindings":
             self._reload_bindings()
+        elif key == "gesture_sequences":
+            self.sequence_matcher.configure(self.store.get("gesture_sequences", []))
+            self._refresh_sequences()
 
     def _reload_bindings(self) -> None:
         self.bindings = list(self.store.get("gesture_bindings", []))
@@ -643,6 +1076,11 @@ class CameraWidget(QWidget):
         beta = self.brightness.value()
         if beta:
             frame = cv2.convertScaleAbs(frame, alpha=1.0, beta=beta)
+        if self.auto_enhance_check.isChecked():
+            frame = auto_enhance(frame)
+        if self.roi_check.isChecked():
+            roi = [slider.value() / 100.0 for slider in self.roi_sliders]
+            frame, _ = apply_roi_mask(frame, roi)
 
         now = time.monotonic()
         interval = int(self.store.get("camera.inference_interval_ms", 100)) / 1000.0
@@ -654,6 +1092,7 @@ class CameraWidget(QWidget):
             )
         if now - self._last_inference >= interval:
             self._last_inference = now
+            inference_started = time.perf_counter()
             frame, landmarks, _ = self.renderer.process_frame(
                 frame,
                 self.show_face.isChecked(),
@@ -661,6 +1100,11 @@ class CameraWidget(QWidget):
                 self.show_pose.isChecked(),
             )
             self._update_hands(frame, landmarks)
+            self._last_inference_ms = (
+                time.perf_counter() - inference_started
+            ) * 1000.0
+        if self.hud_check.isChecked():
+            self._draw_hud(frame)
         self.set_image(self.video, frame)
         self._update_performance()
 
@@ -671,7 +1115,33 @@ class CameraWidget(QWidget):
         self._frame_times = [stamp for stamp in self._frame_times if stamp >= cutoff]
         fps = max(0, len(self._frame_times) - 1)
         suffix = "рука" if self._last_hand_count == 1 else "руки"
-        self.performance_status.setText(f"{fps} FPS · {self._last_hand_count} {suffix}")
+        device = self.yolo_model.device.upper() if self.yolo_model else "CPU"
+        self.performance_status.setText(
+            f"{fps} FPS · {self._last_hand_count} {suffix} · {device}"
+        )
+
+    def _draw_hud(self, frame: np.ndarray) -> None:
+        model = str(self.model_combo.currentData()).upper()
+        lines = [
+            f"{model} / {self.yolo_model.device.upper() if self.yolo_model else 'CPU'}",
+            f"gesture: {self._last_gesture}  confidence: {self._last_confidence:.0%}",
+            f"inference: {self._last_inference_ms:.1f} ms  cooldown: {self._last_cooldown_ms} ms",
+            f"hold: {self.hold_ms.value()} ms  profile: {self.profile_combo.currentData()}",
+        ]
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (12, 12), (470, 108), (7, 12, 24), -1)
+        cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+        for index, line in enumerate(lines):
+            cv2.putText(
+                frame,
+                line,
+                (24, 34 + index * 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (140, 220, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
     def _update_hands(self, frame: np.ndarray, landmarks: Dict[str, Any]) -> None:
         seen = set()
@@ -697,6 +1167,8 @@ class CameraWidget(QWidget):
                 preview.update_hand(
                     "Левая" if side == "Left" else "Правая", gesture, confidence, crop
                 )
+                self._collect_calibration(raw_hand)
+                self._collect_custom_sample(side, raw_hand)
                 self._stabilize_and_fire(side, gesture, confidence)
             except Exception:
                 self.logger.exception("Failed to process detected hand %s", index)
@@ -708,6 +1180,9 @@ class CameraWidget(QWidget):
             self._stabilize_and_fire("Right", "no_gesture", 0.0)
 
     def _recognize_crop(self, crop: np.ndarray, raw_hand: Any) -> Tuple[str, float]:
+        custom = self.custom_gestures.predict(raw_hand)
+        if custom is not None and custom[1] >= 0.45:
+            return custom
         if self.model_combo.currentData() == "yolo" and self.yolo_model is not None:
             probabilities = self.yolo_model.predict_probs(
                 crop, input_is_rgb=True
@@ -722,6 +1197,59 @@ class CameraWidget(QWidget):
         gesture = CANONICAL_GESTURE.get(gesture, gesture)
         confidence = 0.9 if gesture not in {"unknown", "no_gesture"} else 0.4
         return gesture, confidence
+
+    def _collect_calibration(self, raw_hand: Any) -> None:
+        if self._calibration_samples is None or len(self._calibration_samples) >= 40:
+            return
+        points = getattr(raw_hand, "landmark", None)
+        if not points:
+            return
+        xy = np.asarray([[point.x, point.y] for point in points], dtype=np.float32)
+        spread = float(np.max(np.linalg.norm(xy - xy[0], axis=1)))
+        if spread > 0.03:
+            self._calibration_samples.append(spread)
+        if len(self._calibration_samples) == 40:
+            median = float(np.median(self._calibration_samples))
+            scale = max(0.5, min(2.0, 0.32 / max(0.05, median)))
+            recommended_padding = max(12, min(70, round(34 * scale)))
+            self.padding.setValue(recommended_padding)
+            self.store.set("camera.calibration_scale", scale)
+            self._set_camera_status(
+                "good",
+                f"Калибровка завершена: масштаб {scale:.2f}, отступ {recommended_padding}",
+            )
+            self._calibration_samples = None
+
+    def _collect_custom_sample(self, side: str, raw_hand: Any) -> None:
+        if not self._recording_name or len(self._recording_samples) >= 30:
+            return
+        if not self._recording_side:
+            self._recording_side = side
+        if side != self._recording_side:
+            return
+        vector = normalized_landmarks(raw_hand)
+        if vector is None:
+            return
+        self._recording_samples.append(vector.tolist())
+        count = len(self._recording_samples)
+        self._set_camera_status(
+            "warn", f"Запись «{self._recording_name}»: {count}/30 кадров"
+        )
+        if count == 30:
+            name = self._recording_name
+            try:
+                saved = self.custom_gestures.train(name, self._recording_samples)
+                if name not in GESTURES:
+                    GESTURES.append(name)
+                self._set_camera_status(
+                    "good", f"Жест «{name}» обучен на {saved} кадрах"
+                )
+            except Exception as exc:
+                self._set_camera_status("bad", f"Не удалось обучить жест: {exc}")
+            finally:
+                self._recording_name = ""
+                self._recording_side = ""
+                self._recording_samples = []
 
     @staticmethod
     def _crop(frame: np.ndarray, points: List[Tuple[int, int]], padding: int) -> Optional[np.ndarray]:
@@ -739,20 +1267,66 @@ class CameraWidget(QWidget):
 
     def _stabilize_and_fire(self, side: str, gesture: str, confidence: float) -> None:
         state = self._hand_state[side]
+        now = time.monotonic()
         if gesture in {"unknown", "no_gesture"}:
             state["count"] = max(0, int(state["count"]) - 1)
             if state["count"] == 0:
-                state["gesture"] = ""
-                state["fired"] = False
+                state.update(
+                    {
+                        "gesture": "",
+                        "fired": False,
+                        "first_seen": 0.0,
+                        "logged": False,
+                    }
+                )
             return
         if state["gesture"] == gesture:
             state["count"] += 1
         else:
-            state.update({"gesture": gesture, "count": 1, "fired": False})
+            state.update(
+                {
+                    "gesture": gesture,
+                    "count": 1,
+                    "fired": False,
+                    "first_seen": now,
+                    "logged": False,
+                }
+            )
         stable_frames = int(self.store.get("camera.stable_frames", 3))
-        if state["count"] < stable_frames or state["fired"]:
+        held_ms = (now - float(state["first_seen"])) * 1000.0
+        if state["count"] < stable_frames or held_ms < self.hold_ms.value():
+            return
+        self._last_gesture = gesture
+        self._last_confidence = confidence
+        if not state["logged"]:
+            self.history.add(
+                side,
+                gesture,
+                confidence,
+                str(self.model_combo.currentData()),
+            )
+            state["logged"] = True
+            self._refresh_history()
+        sequence = self.sequence_matcher.feed(gesture, now)
+        if sequence is not None and self.actions_toggle.isChecked():
+            self._execute_or_confirm(sequence, side, f"цепочка {sequence.get('name', '')}")
+            state["fired"] = True
+            return
+        if state["fired"]:
             return
         if not self.actions_toggle.isChecked():
+            return
+        confirmation = str(
+            self.store.get("camera.confirmation_gesture", "ok")
+        )
+        if gesture == confirmation and self._pending_gesture_action is not None:
+            action, pending_side, expires = self._pending_gesture_action
+            self._pending_gesture_action = None
+            if now <= expires:
+                self._perform_gesture_action(action, pending_side, "подтверждено")
+            else:
+                self._set_camera_status("warn", "Подтверждение жеста истекло")
+            state["fired"] = True
             return
         for binding in self.bindings:
             if not binding.get("enabled", True) or binding.get("gesture") != gesture:
@@ -760,19 +1334,54 @@ class CameraWidget(QWidget):
             if confidence < float(binding.get("confidence", 0.8)):
                 continue
             key = (side, gesture)
-            now = time.monotonic()
             cooldown = int(binding.get("cooldown_ms", 1200)) / 1000.0
+            self._last_cooldown_ms = max(
+                0, round((cooldown - (now - self._last_action.get(key, 0.0))) * 1000)
+            )
             if now - self._last_action.get(key, 0.0) < cooldown:
                 continue
-            try:
-                message = self.executor.execute(binding)
-                self._last_action[key] = now
-                state["fired"] = True
-                self._set_camera_status("good", f"{side}: {message}")
-            except Exception as exc:
-                state["fired"] = True
-                self._set_camera_status("bad", str(exc))
+            self._execute_or_confirm(binding, side, gesture)
+            state["fired"] = True
             break
+
+    def _execute_or_confirm(
+        self, action: Dict[str, Any], side: str, label: str
+    ) -> None:
+        confirmation_enabled = bool(
+            self.store.get("camera.confirmation_gesture_enabled", False)
+        )
+        confirmation = str(self.store.get("camera.confirmation_gesture", "ok"))
+        if confirmation_enabled and label != confirmation:
+            self._pending_gesture_action = (
+                dict(action),
+                side,
+                time.monotonic() + 5.0,
+            )
+            self._set_camera_status(
+                "warn", f"{label}: покажи «{GESTURE_LABELS.get(confirmation, confirmation)}»"
+            )
+            return
+        self._perform_gesture_action(action, side, label)
+
+    def _perform_gesture_action(
+        self, action: Dict[str, Any], side: str, label: str
+    ) -> None:
+        try:
+            message = self.executor.execute(action)
+            gesture = str(action.get("gesture", label))
+            self._last_action[(side, gesture)] = time.monotonic()
+            self._last_cooldown_ms = int(action.get("cooldown_ms", 0))
+            self.history.add(
+                side,
+                gesture,
+                self._last_confidence,
+                str(self.model_combo.currentData()),
+                action=message,
+            )
+            self._refresh_history()
+            self._set_camera_status("good", f"{side}: {message}")
+        except Exception as exc:
+            self._set_camera_status("bad", str(exc))
 
     def _set_camera_status(self, level: str, text: str) -> None:
         names = {"good": "StatusGood", "warn": "StatusWarn", "bad": "StatusBad"}
@@ -809,6 +1418,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Axi Control · Жесты и Jarvis")
         self.resize(1440, 920)
         self.setMinimumSize(1080, 720)
+        self._quitting = False
+        self._cleaned = False
 
         self.camera_page = CameraWidget(self.store)
         self.assistant_page = AssistantWindow(self.store)
@@ -817,6 +1428,9 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.assistant_page)
         self._build_shell()
         self._install_shortcuts()
+        self._setup_tray()
+        self._setup_global_hotkey()
+        self.store.changed.connect(self._global_setting_changed)
         self.camera_page.status_changed.connect(self._status)
         self.assistant_page.status_changed.connect(self._status)
         self.camera_page.start()
@@ -884,6 +1498,70 @@ class MainWindow(QMainWindow):
             shortcut.activated.connect(callback)
             self._shortcuts.append(shortcut)
 
+    def _setup_tray(self) -> None:
+        self.tray = QSystemTrayIcon(self)
+        self.tray.setIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
+        self.tray.setToolTip("Axi Control · жесты и Jarvis")
+        menu = QMenu(self)
+        show_action = QAction("Показать Axi Control", self)
+        show_action.triggered.connect(self._show_from_tray)
+        ptt_action = QAction("Push-to-Talk", self)
+        ptt_action.triggered.connect(self.assistant_page.push_to_talk)
+        quit_action = QAction("Выйти", self)
+        quit_action.triggered.connect(self._quit_app)
+        menu.addAction(show_action)
+        menu.addAction(ptt_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda reason: self._show_from_tray()
+            if reason == QSystemTrayIcon.DoubleClick
+            else None
+        )
+        self.tray.show()
+
+    def _setup_global_hotkey(self) -> None:
+        sequence = str(
+            self.store.get("assistant.push_to_talk_hotkey", "ctrl+alt+j")
+        ).strip()
+        self.global_hotkey = GlobalHotkey(sequence, self)
+        self.global_hotkey.activated.connect(self.assistant_page.push_to_talk)
+        self.global_hotkey.status.connect(
+            lambda ok, message: self._status("good" if ok else "warn", message)
+        )
+        self.global_hotkey.start()
+
+    def _global_setting_changed(self, key: str, _value: Any) -> None:
+        if key != "assistant.push_to_talk_hotkey" or self._cleaned:
+            return
+        self.global_hotkey.stop()
+        self.global_hotkey.sequence = str(
+            self.store.get("assistant.push_to_talk_hotkey", "ctrl+alt+j")
+        ).strip()
+        self.global_hotkey.start()
+
+    def _show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_app(self) -> None:
+        self._quitting = True
+        self._cleanup()
+        self.tray.hide()
+        app = QApplication.instance()
+        if app:
+            app.quit()
+
+    def _cleanup(self) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
+        self.global_hotkey.stop()
+        self.camera_page.cleanup()
+        self.assistant_page.cleanup()
+
     def _show_page(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
         self.camera_button.setChecked(index == 0)
@@ -911,8 +1589,21 @@ class MainWindow(QMainWindow):
         self.global_status.style().polish(self.global_status)
 
     def closeEvent(self, event) -> None:
-        self.camera_page.cleanup()
-        self.assistant_page.cleanup()
+        if (
+            not self._quitting
+            and bool(self.store.get("assistant.close_to_tray", True))
+            and self.tray.isVisible()
+        ):
+            self.hide()
+            self.tray.showMessage(
+                "Axi Control работает в фоне",
+                "Ctrl+Alt+J включает Push-to-Talk. Выход — через меню трея.",
+                QSystemTrayIcon.Information,
+                2500,
+            )
+            event.ignore()
+            return
+        self._cleanup()
         event.accept()
 
 
@@ -922,12 +1613,12 @@ def main() -> None:
     window = MainWindow()
     window.show()
     # Let Ctrl+C from run.bat close native camera/MediaPipe resources cleanly.
-    signal.signal(signal.SIGINT, lambda *_args: window.close())
+    signal.signal(signal.SIGINT, lambda *_args: window._quit_app())
     signal_pump = QTimer()
     signal_pump.timeout.connect(lambda: None)
     signal_pump.start(400)
     exit_code = app.exec_()
-    window.close()
+    window._cleanup()
     sys.exit(exit_code)
 
 

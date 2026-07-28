@@ -7,22 +7,42 @@ import asyncio
 import ctypes
 import os
 import queue
+import re
 import tempfile
 import threading
 import time
+import wave
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
+import numpy as np
 import pyttsx3
 
+# ONNX Runtime must be loaded before Qt on Windows. Loading it lazily after
+# PyQt5 can fail in DLL initialization even though Piper itself is installed.
+try:
+    from piper import PiperVoice, SynthesisConfig
+
+    PIPER_AVAILABLE = True
+    PIPER_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - depends on optional native runtime
+    PiperVoice = SynthesisConfig = None  # type: ignore[assignment]
+    PIPER_AVAILABLE = False
+    PIPER_IMPORT_ERROR = exc
+
+from utils.config_store import PROJECT_ROOT
 
 NEURAL_VOICES = [
     ("ru-RU-DmitryNeural", "Дмитрий · мужской, глубокий"),
     ("ru-RU-SvetlanaNeural", "Светлана · женский, мягкий"),
 ]
 DEFAULT_NEURAL_VOICE = "ru-RU-DmitryNeural"
+PIPER_VOICES = [
+    ("ru_RU-denis-medium", "Денис · мужской нейронный, офлайн"),
+]
+DEFAULT_PIPER_VOICE = "ru_RU-denis-medium"
 
 
 class SpeechCancelled(Exception):
@@ -38,6 +58,8 @@ class SpeechRequest:
     rate: int
     volume: float
     pitch: int
+    fallback_engine: str = "system"
+    profile: str = "calm"
 
 
 def list_voices() -> List[Tuple[str, str]]:
@@ -53,26 +75,33 @@ def list_voices() -> List[Tuple[str, str]]:
 class TTSEngine:
     """Serializes all speech work on one thread.
 
-    ``edge`` uses a high-quality Microsoft neural voice over the network.
-    When the service is unavailable, the same utterance automatically falls
-    back to the local Windows SAPI voice.
+    ``piper`` is the default high-quality local neural voice. ``edge`` remains
+    available as an online option, and ``system`` is a separate explicit SAPI
+    option. Fallback is configurable so a selected neural voice is never
+    silently replaced with Microsoft SAPI.
     """
 
     def __init__(
         self,
         *,
-        engine: str = "edge",
-        voice_id: Optional[str] = DEFAULT_NEURAL_VOICE,
+        engine: str = "piper",
+        voice_id: Optional[str] = None,
         rate: int = 175,
         volume: float = 0.9,
         pitch: int = -12,
+        fallback_engine: str = "none",
+        profile: str = "calm",
         on_event: Optional[Callable[[str, str], None]] = None,
     ):
-        self.engine_name = engine if engine in {"edge", "system"} else "edge"
-        self.voice_id = voice_id or DEFAULT_NEURAL_VOICE
+        self.engine_name = engine if engine in {"piper", "edge", "system"} else "edge"
+        self.voice_id = voice_id or (
+            DEFAULT_PIPER_VOICE if self.engine_name == "piper" else DEFAULT_NEURAL_VOICE
+        )
         self.rate = max(90, min(260, int(rate)))
         self.volume = max(0.0, min(1.0, float(volume)))
         self.pitch = max(-50, min(50, int(pitch)))
+        self.fallback_engine = fallback_engine if fallback_engine in {"none", "system"} else "none"
+        self.profile = profile if profile in {"calm", "strict", "emotional"} else "calm"
         self.is_speaking = False
 
         self.speech_queue: "queue.Queue[Optional[SpeechRequest]]" = queue.Queue()
@@ -80,6 +109,8 @@ class TTSEngine:
         self._generation = 0
         self._mci_alias = ""
         self._edge_retry_after = 0.0
+        self._piper_voice = None
+        self._piper_voice_id = ""
         self._on_event = on_event
         self._stopping = threading.Event()
         self.worker_thread = threading.Thread(
@@ -105,7 +136,32 @@ class TTSEngine:
         self.is_speaking = True
         self._notify("synthesizing", "Готовлю голос…")
         try:
+            if request.engine == "piper":
+                try:
+                    self._speak_piper(request)
+                    self._notify("done", "Локальный Neural-голос воспроизведён")
+                    return
+                except SpeechCancelled:
+                    self._notify("cancelled", "Озвучка остановлена")
+                    return
+                except Exception as exc:
+                    if request.fallback_engine != "system":
+                        raise RuntimeError(
+                            f"Локальный Neural недоступен: {exc}. "
+                            "Системный голос не подменял выбранный."
+                        ) from exc
+                    self._notify(
+                        "fallback",
+                        f"Piper недоступен — явно включён резерв Windows: {exc}",
+                    )
             if request.engine == "edge":
+                if (
+                    time.monotonic() < self._edge_retry_after
+                    and request.fallback_engine != "system"
+                ):
+                    raise RuntimeError(
+                        "Онлайн Neural временно недоступен; резерв Windows выключен"
+                    )
                 if time.monotonic() >= self._edge_retry_after:
                     try:
                         self._speak_edge(request)
@@ -120,10 +176,12 @@ class TTSEngine:
                         # online service. Retry after five minutes or settings save.
                         self._edge_retry_after = time.monotonic() + 300.0
                         print(f"Neural TTS unavailable, using Windows voice: {exc}")
-                        self._notify(
-                            "fallback",
-                            "Neural недоступен — использую голос Windows",
-                        )
+                        if request.fallback_engine != "system":
+                            raise RuntimeError(
+                                f"Онлайн Neural недоступен: {exc}. "
+                                "Системный голос не подменял выбранный."
+                            ) from exc
+                        self._notify("fallback", "Neural недоступен — включён резерв Windows")
             self._speak_offline(request)
             self._notify("done", "Голос воспроизведён")
         except SpeechCancelled:
@@ -133,6 +191,73 @@ class TTSEngine:
             self._notify("error", f"Ошибка озвучки: {exc}")
         finally:
             self.is_speaking = False
+
+    def _speak_piper(self, request: SpeechRequest) -> None:
+        if not PIPER_AVAILABLE or PiperVoice is None or SynthesisConfig is None:
+            raise RuntimeError(f"Piper не загрузился: {PIPER_IMPORT_ERROR}")
+
+        voice_id = request.voice_id or DEFAULT_PIPER_VOICE
+        model_path = PROJECT_ROOT / "models" / "piper" / f"{voice_id}.onnx"
+        config_path = model_path.with_suffix(".onnx.json")
+        if not model_path.is_file() or not config_path.is_file():
+            raise RuntimeError(
+                f"модель {voice_id} не установлена; запустите setup_venv.bat"
+            )
+        if self._piper_voice is None or self._piper_voice_id != voice_id:
+            self._notify("loading", f"Загружаю локальный голос {voice_id}…")
+            self._piper_voice = PiperVoice.load(model_path, config_path)
+            self._piper_voice_id = voice_id
+        if self._is_cancelled(request.generation):
+            raise SpeechCancelled
+        handle, raw_path = tempfile.mkstemp(prefix="axi-piper-", suffix=".wav")
+        os.close(handle)
+        path = Path(raw_path)
+        try:
+            length_scale = max(0.62, min(1.65, 175.0 / max(1, request.rate)))
+            noise_scale, noise_w_scale = {
+                "strict": (0.38, 0.48),
+                "calm": (0.55, 0.72),
+                "emotional": (0.82, 0.92),
+            }.get(request.profile, (0.55, 0.72))
+            config = SynthesisConfig(
+                length_scale=length_scale,
+                noise_scale=noise_scale,
+                noise_w_scale=noise_w_scale,
+                volume=request.volume,
+                normalize_audio=True,
+            )
+            with wave.open(str(path), "wb") as output:
+                self._piper_voice.synthesize_wav(request.text, output, config)
+            if self._is_cancelled(request.generation):
+                raise SpeechCancelled
+            self._notify("playing", "Воспроизвожу Piper · полностью офлайн")
+            self._play_wav(path, request.generation)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def _play_wav(self, path: Path, generation: int) -> None:
+        import sounddevice as sd
+
+        with wave.open(str(path), "rb") as source:
+            channels = source.getnchannels()
+            sample_width = source.getsampwidth()
+            sample_rate = source.getframerate()
+            frames = source.readframes(source.getnframes())
+        if sample_width != 2:
+            raise RuntimeError(f"Неподдерживаемая разрядность WAV: {sample_width * 8}")
+        audio = np.frombuffer(frames, dtype=np.int16)
+        if channels > 1:
+            audio = audio.reshape(-1, channels)
+        sd.play(audio, sample_rate, blocking=False)
+        try:
+            while bool(sd.get_stream().active):
+                if self._is_cancelled(generation):
+                    sd.stop()
+                    raise SpeechCancelled
+                time.sleep(0.04)
+        finally:
+            if self._is_cancelled(generation):
+                sd.stop()
 
     def _speak_edge(self, request: SpeechRequest) -> None:
         import edge_tts
@@ -285,6 +410,8 @@ class TTSEngine:
                 rate=self.rate,
                 volume=self.volume,
                 pitch=self.pitch,
+                fallback_engine=self.fallback_engine,
+                profile=self.profile,
             )
         self.speech_queue.put(request)
         self._notify("queued", "Фраза добавлена в очередь")
@@ -297,9 +424,12 @@ class TTSEngine:
         rate: int,
         volume: float,
         pitch: int,
+        fallback_engine: Optional[str] = None,
+        profile: Optional[str] = None,
     ) -> None:
-        new_engine = engine if engine in {"edge", "system"} else "edge"
-        new_voice = voice_id or DEFAULT_NEURAL_VOICE
+        new_engine = engine if engine in {"piper", "edge", "system"} else "edge"
+        default_voice = DEFAULT_PIPER_VOICE if new_engine == "piper" else DEFAULT_NEURAL_VOICE
+        new_voice = voice_id or default_voice
         with self._state_lock:
             provider_changed = (
                 new_engine != self.engine_name or new_voice != self.voice_id
@@ -309,6 +439,14 @@ class TTSEngine:
             self.rate = max(90, min(260, int(rate)))
             self.volume = max(0.0, min(1.0, float(volume)))
             self.pitch = max(-50, min(50, int(pitch)))
+            if fallback_engine is not None:
+                self.fallback_engine = (
+                    fallback_engine if fallback_engine in {"none", "system"} else "none"
+                )
+            if profile is not None:
+                self.profile = (
+                    profile if profile in {"calm", "strict", "emotional"} else "calm"
+                )
             if provider_changed:
                 self._edge_retry_after = 0.0
 
@@ -322,13 +460,23 @@ class TTSEngine:
         self.voice_id = voice_id
 
     def set_engine(self, engine: str) -> None:
-        self.engine_name = engine if engine in {"edge", "system"} else "edge"
+        self.engine_name = engine if engine in {"piper", "edge", "system"} else "edge"
 
     def set_pitch(self, pitch: int) -> None:
         self.pitch = max(-50, min(50, int(pitch)))
 
     def get_voices(self) -> List[Tuple[str, str]]:
         return list_voices()
+
+    def speak_stream(self, text: str) -> None:
+        """Queue sentence-sized chunks for earlier, interruptible playback."""
+        chunks = [
+            part.strip()
+            for part in re.split(r"(?<=[.!?…])\s+|\n+", str(text).strip())
+            if part.strip()
+        ]
+        for chunk in chunks or [str(text).strip()]:
+            self.speak(chunk)
 
     def stop(self) -> None:
         with self._state_lock:
@@ -348,6 +496,10 @@ class TTSEngine:
             self.speech_queue.put(None)
         if alias and os.name == "nt":
             self._mci(f"stop {alias}", check=False)
+        with suppress(Exception):
+            import sounddevice as sd
+
+            sd.stop()
         self.is_speaking = False
 
     def shutdown(self) -> None:

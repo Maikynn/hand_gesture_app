@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from assistant.actions import ActionError, ActionExecutor
 from assistant.llm_client import LLMClient, LLMError, LLMSettings
+from assistant.memory_store import MemoryStore
 from utils.config_store import ConfigStore, PROJECT_ROOT
 
 
@@ -79,10 +80,13 @@ class EmbeddedJarvis:
         self.executor = executor or ActionExecutor(store.get("permissions", []))
         self.llm = llm or LLMClient()
         self.voice_pack = voice_pack or PrilerVoicePack()
+        self.memory = MemoryStore()
         self.commands: List[Dict[str, Any]] = []
         self.error_phrases: List[str] = []
         self.threshold = 66.0
         self.wake_phrases: List[str] = []
+        self.confirmation_level = "none"
+        self._pending_command: Optional[Tuple[Dict[str, Any], float]] = None
         self.reload()
 
     def reload(self) -> None:
@@ -92,6 +96,7 @@ class EmbeddedJarvis:
             if isinstance(command, dict)
         ]
         self.executor.set_permissions(self.store.get("permissions", []))
+        self.executor.set_scenarios(self.store.get("scenarios", []))
         assistant = self.store.get("assistant", {}) or {}
         self.threshold = float(assistant.get("command_match_threshold", 66))
         self.error_phrases = [
@@ -102,6 +107,9 @@ class EmbeddedJarvis:
         self.wake_phrases = self._split_phrases(
             str(assistant.get("wake_phrases", "джарвис, аксиос"))
         )
+        self.confirmation_level = str(
+            assistant.get("confirmation_level", "none")
+        ).lower()
         provider = str(assistant.get("llm_provider", "none"))
         api_keys = assistant.get("api_keys", {}) or {}
         endpoint = ""
@@ -192,32 +200,141 @@ class EmbeddedJarvis:
         if not clean:
             self.voice_pack.play("reply")
             return AssistantResult("Слушаю.", "wake")
+        normalized = clean.lower().strip(" ,.!?")
+        if self._pending_command is not None:
+            if normalized in {"да", "подтверждаю", "выполняй", "согласен", "окей"}:
+                command, score = self._pending_command
+                self._pending_command = None
+                return self._execute_command(command, score)
+            if normalized in {"нет", "отмена", "не надо", "отставить"}:
+                self._pending_command = None
+                return AssistantResult("Отменено.", "cancelled")
+            return AssistantResult(
+                "Жду «да» для выполнения или «нет» для отмены.", "confirmation"
+            )
+        if normalized in {"отмени", "отмени последнее", "верни как было"}:
+            try:
+                return AssistantResult(
+                    self.executor.undo_last(), "command", "undo", 100.0
+                )
+            except ActionError as exc:
+                return AssistantResult(str(exc), "error", "undo", 100.0, str(exc))
+        if normalized.startswith(("запомни ", "запомни что ")):
+            value = re.sub(
+                r"^запомни(?:\s+что)?\s+", "", clean, flags=re.IGNORECASE
+            )
+            try:
+                self.memory.remember(value)
+                return AssistantResult(
+                    "Запомнил. Это можно удалить в настройках памяти.", "command"
+                )
+            except ValueError as exc:
+                return AssistantResult(str(exc), "error", error=str(exc))
+        if normalized in {"что ты помнишь", "покажи память", "моя память"}:
+            values = [str(item.get("text", "")) for item in self.memory.items[-10:]]
+            memory_text = "\n".join(f"• {value}" for value in values if value)
+            return AssistantResult(memory_text or "Память пока пуста.", "answer")
         match = self.find_command(clean)
         if match:
             command, score = match
-            try:
-                response = self.executor.execute(command)
-                response = str(command.get("reply") or response)
-                self.voice_pack.play("ok")
+            if self._needs_confirmation(command):
+                self._pending_command = (command, score)
                 return AssistantResult(
-                    response,
-                    "command",
+                    f"Подтвердить действие: "
+                    f"{command.get('reply') or command.get('target')}? "
+                    "Скажи «да» или «нет».",
+                    "confirmation",
                     command_id=str(command.get("id", "")),
                     score=score,
                 )
-            except ActionError as exc:
-                self.voice_pack.play("not_found")
-                return AssistantResult(
-                    self._funny_error(), "error", str(command.get("id", "")), score, str(exc)
-                )
-            except Exception as exc:
-                self.voice_pack.play("not_found")
-                return AssistantResult(
-                    self._funny_error(), "error", str(command.get("id", "")), score, str(exc)
-                )
+            return self._execute_command(command, score)
         try:
-            answer = self.llm.send_message(clean)
+            base_prompt = str(self.llm.settings.system_prompt or "")
+            memory = self.memory.prompt_context()
+            prompt = "\n\n".join(value for value in (base_prompt, memory) if value)
+            try:
+                answer = self.llm.send_message(clean, system_prompt=prompt)
+            except TypeError:
+                # Small injected test/third-party clients may expose the older
+                # one-argument surface.
+                answer = self.llm.send_message(clean)
             return AssistantResult(answer, "answer")
+        except LLMError as exc:
+            self.voice_pack.play("not_found")
+            return AssistantResult(self._funny_error(), "fallback", error=str(exc))
+
+    def _needs_confirmation(self, command: Dict[str, Any]) -> bool:
+        if bool(command.get("requires_confirmation", False)):
+            return True
+        kind = str(command.get("type", "")).lower()
+        if self.confirmation_level == "all":
+            return kind != "response"
+        if self.confirmation_level != "dangerous":
+            return False
+        target = str(command.get("target", "")).lower()
+        return kind in {"application", "url", "hotkey", "scenario"} or (
+            kind == "system" and target in {"lock", "screenshot"}
+        )
+
+    def _execute_command(
+        self, command: Dict[str, Any], score: float
+    ) -> AssistantResult:
+        try:
+            response = self.executor.execute(command)
+            response = str(command.get("reply") or response)
+            self.voice_pack.play("ok")
+            return AssistantResult(
+                response,
+                "command",
+                command_id=str(command.get("id", "")),
+                score=score,
+            )
+        except ActionError as exc:
+            self.voice_pack.play("not_found")
+            return AssistantResult(
+                self._funny_error(),
+                "error",
+                str(command.get("id", "")),
+                score,
+                str(exc),
+            )
+        except Exception as exc:
+            self.voice_pack.play("not_found")
+            return AssistantResult(
+                self._funny_error(),
+                "error",
+                str(command.get("id", "")),
+                score,
+                str(exc),
+            )
+
+    def handle_text_stream(
+        self, text: str, on_sentence
+    ) -> AssistantResult:
+        """Stream ordinary LLM answers; commands keep the deterministic path."""
+        clean = self.strip_wake_phrase(text)
+        normalized = clean.lower().strip(" ,.!?")
+        special = (
+            self._pending_command is not None
+            or normalized.startswith(("запомни ", "запомни что "))
+            or normalized
+            in {
+                "отмени",
+                "отмени последнее",
+                "верни как было",
+                "что ты помнишь",
+                "покажи память",
+                "моя память",
+            }
+        )
+        if special or not clean or self.find_command(clean) or not self.llm.is_configured():
+            return self.handle_text(text)
+        base_prompt = str(self.llm.settings.system_prompt or "")
+        memory = self.memory.prompt_context()
+        prompt = "\n\n".join(value for value in (base_prompt, memory) if value)
+        try:
+            answer = self.llm.send_message_stream(clean, on_sentence, prompt)
+            return AssistantResult(answer, "streamed")
         except LLMError as exc:
             self.voice_pack.play("not_found")
             return AssistantResult(self._funny_error(), "fallback", error=str(exc))

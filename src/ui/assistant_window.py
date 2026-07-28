@@ -36,7 +36,12 @@ from PyQt5.QtWidgets import (
 from assistant.actions import ACTION_LABELS, ActionExecutor
 from assistant.embedded_jarvis import AssistantResult, EmbeddedJarvis
 from assistant.listener import WakeWordListener
-from assistant.tts_engine import NEURAL_VOICES, TTSEngine, list_voices
+from assistant.tts_engine import (
+    NEURAL_VOICES,
+    PIPER_VOICES,
+    TTSEngine,
+    list_voices,
+)
 from utils.config_store import ConfigStore
 
 
@@ -54,6 +59,8 @@ class AssistantSignals(QObject):
     recognized = pyqtSignal(str)
     listener_status = pyqtSignal(str, str)
     tts_status = pyqtSignal(str, str)
+    diagnostics_ready = pyqtSignal(str)
+    stream_sentence = pyqtSignal(str)
 
 
 class AssistantWindow(QWidget):
@@ -64,16 +71,21 @@ class AssistantWindow(QWidget):
     def __init__(self, store: ConfigStore | None = None, parent=None):
         super().__init__(parent)
         self.store = store or ConfigStore()
-        self.executor = ActionExecutor(self.store.get("permissions", []))
+        self.executor = ActionExecutor(
+            self.store.get("permissions", []),
+            scenarios=self.store.get("scenarios", []),
+        )
         self.core = EmbeddedJarvis(self.store, executor=self.executor)
         assistant = self.store.get("assistant", {}) or {}
         self.signals = AssistantSignals()
         self.tts = TTSEngine(
-            engine=str(assistant.get("tts_engine", "edge")),
-            voice_id=str(assistant.get("tts_voice", "ru-RU-DmitryNeural")),
+            engine=str(assistant.get("tts_engine", "piper")),
+            voice_id=str(assistant.get("tts_voice", "ru_RU-denis-medium")),
             rate=int(assistant.get("tts_rate", 175)),
             volume=float(assistant.get("tts_volume", 0.9)),
             pitch=int(assistant.get("tts_pitch", -12)),
+            fallback_engine=str(assistant.get("tts_fallback_engine", "none")),
+            profile=str(assistant.get("tts_profile", "calm")),
             on_event=self.signals.tts_status.emit,
         )
         self.listener = WakeWordListener(
@@ -82,11 +94,14 @@ class AssistantWindow(QWidget):
             stt_engine=str(assistant.get("stt_engine", "vosk")),
             mic_index=self._mic_index(assistant.get("microphone_index", -1)),
             gain=float(assistant.get("microphone_gain", 1.0)),
+            whisper_model=str(assistant.get("whisper_model", "tiny")),
         )
         self.signals.result_ready.connect(self._finish_result)
         self.signals.recognized.connect(self._handle_recognized)
         self.signals.listener_status.connect(self._listener_status)
         self.signals.tts_status.connect(self._tts_status)
+        self.signals.diagnostics_ready.connect(self._show_diagnostics)
+        self.signals.stream_sentence.connect(self._stream_sentence)
         self._busy = False
         self._active_provider = str(assistant.get("llm_provider", "none"))
         self._draft_keys = {
@@ -206,6 +221,10 @@ class AssistantWindow(QWidget):
         layout.setSpacing(12)
         layout.addWidget(self._voice_group())
         layout.addWidget(self._llm_group())
+        layout.addWidget(self._safety_group())
+        layout.addWidget(self._memory_group())
+        layout.addWidget(self._scenarios_group())
+        layout.addWidget(self._diagnostics_group())
         layout.addWidget(self._permissions_group())
         layout.addWidget(self._commands_group())
         save = QPushButton("Сохранить и применить всё")
@@ -244,8 +263,15 @@ class AssistantWindow(QWidget):
 
         self.stt_engine = QComboBox()
         self.stt_engine.addItem("Vosk · офлайн", "vosk")
+        self.stt_engine.addItem("Whisper · нейросеть офлайн", "whisper")
         self.stt_engine.addItem("Google · онлайн", "google")
         form.addRow("Распознавание", self.stt_engine)
+
+        self.whisper_model = QComboBox()
+        self.whisper_model.addItem("Tiny · быстрее", "tiny")
+        self.whisper_model.addItem("Base · точнее", "base")
+        self.whisper_model.addItem("Small · максимум качества", "small")
+        form.addRow("Модель Whisper", self.whisper_model)
 
         mic_row = QHBoxLayout()
         self.microphone = QComboBox()
@@ -270,14 +296,15 @@ class AssistantWindow(QWidget):
         form.addRow("", self.tts_enabled)
 
         self.tts_engine = QComboBox()
-        self.tts_engine.addItem("Jarvis Neural · красивый онлайн-голос", "edge")
+        self.tts_engine.addItem("Piper Neural · красивый офлайн-голос", "piper")
+        self.tts_engine.addItem("Edge Neural · красивый онлайн-голос", "edge")
         self.tts_engine.addItem("Windows · системный офлайн-голос", "system")
         self.tts_engine.currentIndexChanged.connect(self._tts_engine_changed)
         form.addRow("Голосовой движок", self.tts_engine)
 
         voice_row = QHBoxLayout()
         self.tts_voice = QComboBox()
-        for voice_id, label in NEURAL_VOICES:
+        for voice_id, label in PIPER_VOICES:
             self.tts_voice.addItem(label, voice_id)
         self.test_voice = QPushButton("▶ Проверить")
         self.test_voice.setProperty("secondary", True)
@@ -285,6 +312,18 @@ class AssistantWindow(QWidget):
         voice_row.addWidget(self.tts_voice, 1)
         voice_row.addWidget(self.test_voice)
         form.addRow("Голос", voice_row)
+
+        self.tts_fallback = QComboBox()
+        self.tts_fallback.addItem("Не подменять выбранный голос", "none")
+        self.tts_fallback.addItem("Windows, только если Neural сломался", "system")
+        form.addRow("Резервный голос", self.tts_fallback)
+
+        self.tts_profile = QComboBox()
+        self.tts_profile.addItem("Спокойный", "calm")
+        self.tts_profile.addItem("Строгий", "strict")
+        self.tts_profile.addItem("Эмоциональный", "emotional")
+        self.tts_profile.currentIndexChanged.connect(self._apply_voice_profile)
+        form.addRow("Профиль речи", self.tts_profile)
 
         self.tts_rate = QSlider(Qt.Horizontal)
         self.tts_rate.setRange(90, 260)
@@ -325,6 +364,92 @@ class AssistantWindow(QWidget):
         self.provider_hint.setProperty("muted", True)
         self.provider_hint.setWordWrap(True)
         form.addRow("", self.provider_hint)
+        return group
+
+    def _safety_group(self) -> QGroupBox:
+        group = QGroupBox("Безопасность и фоновый режим")
+        form = QFormLayout(group)
+        self.confirmation_level = QComboBox()
+        self.confirmation_level.addItem("Только важные действия", "dangerous")
+        self.confirmation_level.addItem("Каждое действие", "all")
+        self.confirmation_level.addItem("Не спрашивать", "none")
+        form.addRow("Подтверждение", self.confirmation_level)
+        self.push_to_talk_hotkey = QLineEdit()
+        self.push_to_talk_hotkey.setPlaceholderText("ctrl+alt+j")
+        form.addRow("Global Push-to-Talk", self.push_to_talk_hotkey)
+        self.close_to_tray = QCheckBox("Сворачивать в трей при закрытии окна")
+        form.addRow("", self.close_to_tray)
+        hint = QLabel("Фраза «отмени последнее» возвращает последнее обратимое действие.")
+        hint.setProperty("muted", True)
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+        return group
+
+    def _memory_group(self) -> QGroupBox:
+        group = QGroupBox("Долговременная память")
+        layout = QVBoxLayout(group)
+        self.memory_table = QTableWidget(0, 1)
+        self.memory_table.setHorizontalHeaderLabels(["Что помнит Jarvis"])
+        self.memory_table.horizontalHeader().setStretchLastSection(True)
+        self.memory_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.memory_table.setMaximumHeight(150)
+        layout.addWidget(self.memory_table)
+        row = QHBoxLayout()
+        self.memory_input = QLineEdit()
+        self.memory_input.setPlaceholderText("Например: меня зовут Николай")
+        add = QPushButton("+ Запомнить")
+        add.setProperty("secondary", True)
+        add.clicked.connect(self._add_memory)
+        remove = QPushButton("Удалить")
+        remove.setProperty("danger", True)
+        remove.clicked.connect(self._remove_memory)
+        row.addWidget(self.memory_input, 1)
+        row.addWidget(add)
+        row.addWidget(remove)
+        layout.addLayout(row)
+        return group
+
+    def _scenarios_group(self) -> QGroupBox:
+        group = QGroupBox("Многошаговые сценарии")
+        layout = QVBoxLayout(group)
+        hint = QLabel(
+            "Шаги: system=volume_mute | application=C:\\Windows\\System32\\notepad.exe"
+        )
+        hint.setProperty("muted", True)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.scenarios_table = QTableWidget(0, 4)
+        self.scenarios_table.setHorizontalHeaderLabels(
+            ["ID", "Название", "Шаги type=target", "Ответ"]
+        )
+        self.scenarios_table.horizontalHeader().setStretchLastSection(True)
+        self.scenarios_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.scenarios_table.setMaximumHeight(175)
+        layout.addWidget(self.scenarios_table)
+        row = QHBoxLayout()
+        add = QPushButton("+ Сценарий")
+        add.setProperty("secondary", True)
+        add.clicked.connect(self._add_scenario)
+        remove = QPushButton("Удалить")
+        remove.setProperty("danger", True)
+        remove.clicked.connect(lambda: self._remove_selected(self.scenarios_table))
+        row.addWidget(add)
+        row.addWidget(remove)
+        row.addStretch(1)
+        layout.addLayout(row)
+        return group
+
+    def _diagnostics_group(self) -> QGroupBox:
+        group = QGroupBox("Диагностика")
+        layout = QVBoxLayout(group)
+        self.diagnostics = QTextBrowser()
+        self.diagnostics.setMaximumHeight(145)
+        self.diagnostics.setText("Нажми проверку — статусы появятся здесь.")
+        run = QPushButton("Проверить микрофон · STT · TTS · LLM")
+        run.setProperty("secondary", True)
+        run.clicked.connect(self._run_diagnostics)
+        layout.addWidget(self.diagnostics)
+        layout.addWidget(run)
         return group
 
     def _permissions_group(self) -> QGroupBox:
@@ -395,17 +520,30 @@ class AssistantWindow(QWidget):
         assistant = self.store.get("assistant", {}) or {}
         self.wake_phrases.setText(str(assistant.get("wake_phrases", "джарвис, аксиос")))
         self._set_combo_data(self.stt_engine, assistant.get("stt_engine", "vosk"))
+        self._set_combo_data(self.whisper_model, assistant.get("whisper_model", "tiny"))
         self.mic_gain.setValue(float(assistant.get("microphone_gain", 1.0)))
         self.continuous.setChecked(bool(assistant.get("continuous_listening", False)))
         self.tts_enabled.setChecked(bool(assistant.get("tts_enabled", True)))
-        self._set_combo_data(self.tts_engine, assistant.get("tts_engine", "edge"))
+        self._set_combo_data(self.tts_engine, assistant.get("tts_engine", "piper"))
+        self._tts_engine_changed()
         self._set_combo_data(
-            self.tts_voice, assistant.get("tts_voice", "ru-RU-DmitryNeural")
+            self.tts_voice, assistant.get("tts_voice", "ru_RU-denis-medium")
         )
+        self._set_combo_data(
+            self.tts_fallback, assistant.get("tts_fallback_engine", "none")
+        )
+        self._set_combo_data(self.tts_profile, assistant.get("tts_profile", "calm"))
         self.tts_rate.setValue(int(assistant.get("tts_rate", 175)))
         self.tts_pitch.setValue(int(assistant.get("tts_pitch", -12)))
         self.tts_volume.setValue(int(float(assistant.get("tts_volume", 0.9)) * 100))
-        self._tts_engine_changed()
+        self._set_combo_data(
+            self.confirmation_level,
+            assistant.get("confirmation_level", "dangerous"),
+        )
+        self.push_to_talk_hotkey.setText(
+            str(assistant.get("push_to_talk_hotkey", "ctrl+alt+j"))
+        )
+        self.close_to_tray.setChecked(bool(assistant.get("close_to_tray", True)))
         self._set_combo_data(self.provider, assistant.get("llm_provider", "none"))
         self.max_tokens.setValue(int(assistant.get("max_tokens", 350)))
         self.system_prompt.setPlainText(str(assistant.get("system_prompt", "")))
@@ -413,6 +551,8 @@ class AssistantWindow(QWidget):
         self._refresh_microphones(int(assistant.get("microphone_index", -1)))
         self._load_permissions(self.store.get("permissions", []))
         self._load_commands(self.store.get("commands", []))
+        self._load_memory()
+        self._load_scenarios(self.store.get("scenarios", []))
         self._provider_changed()
 
     @staticmethod
@@ -433,9 +573,14 @@ class AssistantWindow(QWidget):
         self.microphone.setCurrentIndex(max(0, index))
 
     def _tts_engine_changed(self, *_args) -> None:
-        neural = str(self.tts_engine.currentData()) == "edge"
+        engine = str(self.tts_engine.currentData())
         selected = self.tts_voice.currentData()
-        choices = NEURAL_VOICES if neural else list_voices()
+        if engine == "piper":
+            choices = PIPER_VOICES
+        elif engine == "edge":
+            choices = NEURAL_VOICES
+        else:
+            choices = list_voices()
         self.tts_voice.blockSignals(True)
         self.tts_voice.clear()
         if choices:
@@ -447,12 +592,25 @@ class AssistantWindow(QWidget):
         self.tts_voice.setCurrentIndex(max(0, index))
         self.tts_voice.blockSignals(False)
         self.tts_voice.setEnabled(bool(choices))
-        self.tts_pitch.setEnabled(neural)
-        self.tts_engine.setToolTip(
-            "Neural требует интернет и автоматически переключается на Windows при ошибке."
-            if neural
-            else "Системный голос работает без интернета."
-        )
+        self.tts_pitch.setEnabled(engine == "edge")
+        tooltips = {
+            "piper": "Настоящий локальный нейронный голос. Интернет после установки не нужен.",
+            "edge": "Онлайн Neural. При сбое Windows включится только если это разрешено ниже.",
+            "system": "Обычный установленный голос Windows.",
+        }
+        self.tts_engine.setToolTip(tooltips.get(engine, ""))
+
+    def _apply_voice_profile(self, *_args) -> None:
+        if not hasattr(self, "tts_rate"):
+            return
+        profile = str(self.tts_profile.currentData())
+        rate, pitch = {
+            "strict": (165, -18),
+            "calm": (175, -10),
+            "emotional": (198, 4),
+        }.get(profile, (175, -10))
+        self.tts_rate.setValue(rate)
+        self.tts_pitch.setValue(pitch)
 
     def _test_voice(self) -> None:
         self.tts.stop()
@@ -462,6 +620,8 @@ class AssistantWindow(QWidget):
             rate=self.tts_rate.value(),
             volume=self.tts_volume.value() / 100.0,
             pitch=self.tts_pitch.value(),
+            fallback_engine=str(self.tts_fallback.currentData()),
+            profile=str(self.tts_profile.currentData()),
         )
         self.tts.speak(
             "Добрый вечер. Системы работают штатно. Я готов к вашим командам."
@@ -511,6 +671,175 @@ class AssistantWindow(QWidget):
         self.permissions_table.setRowCount(0)
         for permission in permissions:
             self._add_permission(permission)
+
+    def _load_memory(self) -> None:
+        self.memory_table.setRowCount(0)
+        for item in self.core.memory.items:
+            row = self.memory_table.rowCount()
+            self.memory_table.insertRow(row)
+            self.memory_table.setItem(row, 0, QTableWidgetItem(str(item.get("text", ""))))
+
+    def _add_memory(self) -> None:
+        value = self.memory_input.text().strip()
+        if not value:
+            return
+        self.core.memory.remember(value)
+        self.memory_input.clear()
+        self._load_memory()
+        self._set_status("good", "Добавлено в локальную память")
+
+    def _remove_memory(self) -> None:
+        rows = sorted(
+            {index.row() for index in self.memory_table.selectedIndexes()}, reverse=True
+        )
+        for row in rows:
+            self.core.memory.delete(row)
+        self._load_memory()
+
+    def _load_scenarios(self, scenarios: List[Dict[str, Any]]) -> None:
+        self.scenarios_table.setRowCount(0)
+        for scenario in scenarios:
+            self._add_scenario(scenario)
+
+    def _add_scenario(self, scenario: Optional[Dict[str, Any]] = None) -> None:
+        scenario = scenario or {
+            "id": f"scenario_{self.scenarios_table.rowCount() + 1}",
+            "name": "Новый сценарий",
+            "steps": [{"type": "system", "target": "volume_mute"}],
+            "reply": "Сценарий выполнен",
+        }
+        row = self.scenarios_table.rowCount()
+        self.scenarios_table.insertRow(row)
+        steps = " | ".join(
+            f"{step.get('type', '')}={step.get('target', '')}"
+            for step in scenario.get("steps", [])
+            if isinstance(step, dict)
+        )
+        values = (
+            scenario.get("id", ""),
+            scenario.get("name", ""),
+            steps,
+            scenario.get("reply", ""),
+        )
+        for column, value in enumerate(values):
+            self.scenarios_table.setItem(row, column, QTableWidgetItem(str(value)))
+
+    def _collect_scenarios(self) -> List[Dict[str, Any]]:
+        scenarios: List[Dict[str, Any]] = []
+        for row in range(self.scenarios_table.rowCount()):
+            cells = [
+                self.scenarios_table.item(row, column)
+                for column in range(self.scenarios_table.columnCount())
+            ]
+            values = [cell.text().strip() if cell else "" for cell in cells]
+            if not values[0]:
+                continue
+            steps = []
+            for value in values[2].split("|"):
+                kind, separator, target = value.strip().partition("=")
+                if separator and kind.strip() and target.strip():
+                    steps.append({"type": kind.strip(), "target": target.strip()})
+            scenarios.append(
+                {
+                    "id": values[0],
+                    "name": values[1] or values[0],
+                    "steps": steps,
+                    "reply": values[3],
+                }
+            )
+        return scenarios
+
+    def _run_diagnostics(self) -> None:
+        self.diagnostics.setText("Проверяю компоненты…")
+        selected_provider = str(self.provider.currentData())
+        selected_endpoint = self.endpoint.text().strip()
+
+        def work() -> None:
+            started = time.perf_counter()
+            lines = []
+            project_root = Path(__file__).resolve().parents[2]
+            microphones = WakeWordListener.list_input_devices()
+            lines.append(
+                f"✅ Микрофоны: {len(microphones)}"
+                if microphones
+                else "❌ Микрофоны не найдены"
+            )
+            try:
+                import piper  # noqa: F401
+
+                voice = project_root / "models/piper/ru_RU-denis-medium.onnx"
+                lines.append(
+                    "✅ Piper: модель установлена"
+                    if voice.is_file()
+                    else "⚠ Piper: пакет есть, модель загрузит setup_venv.bat"
+                )
+            except Exception as exc:
+                lines.append(f"❌ Piper: {exc}")
+            try:
+                import faster_whisper  # noqa: F401
+
+                whisper_model = project_root / "models/whisper/tiny/model.bin"
+                lines.append(
+                    "✅ Whisper: движок и локальная модель установлены"
+                    if whisper_model.is_file()
+                    else "⚠ Whisper: движок есть, модель загрузит setup_venv.bat"
+                )
+            except Exception as exc:
+                lines.append(f"❌ Whisper: {exc}")
+            vosk_model = project_root / str(
+                self.store.get("assistant.vosk_model_path", "models/vosk-ru")
+            )
+            lines.append(
+                "✅ Vosk: локальная модель найдена"
+                if (vosk_model / "am/final.mdl").is_file()
+                else "⚠ Vosk: локальная модель не найдена"
+            )
+            provider = selected_provider
+            if provider == "none":
+                lines.append("⚠ LLM: провайдер не выбран")
+            else:
+                try:
+                    import requests
+
+                    check_started = time.perf_counter()
+                    if provider == "ollama":
+                        url = selected_endpoint.rstrip("/") + "/api/tags"
+                        response = requests.get(url, timeout=3)
+                    elif provider == "openrouter":
+                        response = requests.get(
+                            "https://openrouter.ai/api/v1/models", timeout=4
+                        )
+                    else:
+                        url = selected_endpoint
+                        response = requests.get(url, timeout=3)
+                    latency = (time.perf_counter() - check_started) * 1000
+                    lines.append(
+                        f"✅ LLM {provider}: HTTP {response.status_code}, {latency:.0f} мс"
+                        if response.status_code < 500
+                        else f"❌ LLM {provider}: HTTP {response.status_code}"
+                    )
+                except Exception as exc:
+                    lines.append(f"❌ LLM {provider}: {exc}")
+            try:
+                import requests
+
+                net_started = time.perf_counter()
+                response = requests.get(
+                    "https://www.msftconnecttest.com/connecttest.txt", timeout=3
+                )
+                net_latency = (time.perf_counter() - net_started) * 1000
+                lines.append(
+                    f"✅ Интернет: HTTP {response.status_code}, {net_latency:.0f} мс"
+                )
+            except Exception as exc:
+                lines.append(f"⚠ Интернет: {exc}")
+            lines.append(f"⏱ Диагностика: {(time.perf_counter() - started) * 1000:.0f} мс")
+            self.signals.diagnostics_ready.emit("<br>".join(lines))
+
+        threading.Thread(target=work, name="jarvis-diagnostics", daemon=True).start()
+
+    def _show_diagnostics(self, value: str) -> None:
+        self.diagnostics.setHtml(value)
 
     def _add_permission(self, permission: Optional[Dict[str, Any]] = None) -> None:
         if isinstance(permission, bool):
@@ -628,8 +957,11 @@ class AssistantWindow(QWidget):
     def _save_all(self) -> None:
         permissions = self._collect_permissions()
         commands = self._collect_commands()
-        validator = ActionExecutor(permissions)
+        scenarios = self._collect_scenarios()
+        validator = ActionExecutor(permissions, scenarios=scenarios)
         try:
+            for scenario in scenarios:
+                validator.validate({"type": "scenario", "target": scenario["id"]})
             for command in commands:
                 if command["enabled"]:
                     validator.validate(command)
@@ -643,18 +975,24 @@ class AssistantWindow(QWidget):
         values: Dict[str, Any] = {
             "assistant.wake_phrases": self.wake_phrases.text().strip(),
             "assistant.stt_engine": str(self.stt_engine.currentData()),
+            "assistant.whisper_model": str(self.whisper_model.currentData()),
             "assistant.microphone_index": int(self.microphone.currentData()),
             "assistant.microphone_gain": float(self.mic_gain.value()),
             "assistant.continuous_listening": self.continuous.isChecked(),
             "assistant.tts_enabled": self.tts_enabled.isChecked(),
             "assistant.tts_engine": str(self.tts_engine.currentData()),
             "assistant.tts_voice": str(self.tts_voice.currentData()),
+            "assistant.tts_fallback_engine": str(self.tts_fallback.currentData()),
+            "assistant.tts_profile": str(self.tts_profile.currentData()),
             "assistant.tts_rate": self.tts_rate.value(),
             "assistant.tts_pitch": self.tts_pitch.value(),
             "assistant.tts_volume": self.tts_volume.value() / 100.0,
             "assistant.llm_provider": provider,
             "assistant.max_tokens": self.max_tokens.value(),
             "assistant.system_prompt": self.system_prompt.toPlainText().strip(),
+            "assistant.confirmation_level": str(self.confirmation_level.currentData()),
+            "assistant.close_to_tray": self.close_to_tray.isChecked(),
+            "assistant.push_to_talk_hotkey": self.push_to_talk_hotkey.text().strip(),
         }
         if provider == "openrouter":
             values["assistant.openrouter_model"] = self.model.text().strip()
@@ -669,7 +1007,9 @@ class AssistantWindow(QWidget):
         self.store.update_many(values)
         self.store.replace_section("permissions", permissions)
         self.store.replace_section("commands", commands)
+        self.store.replace_section("scenarios", scenarios)
         self.executor.set_permissions(permissions)
+        self.executor.set_scenarios(scenarios)
         self.core.reload()
         self.listener.configure(
             wake_word=self.wake_phrases.text().strip(),
@@ -677,6 +1017,7 @@ class AssistantWindow(QWidget):
             stt_engine=str(self.stt_engine.currentData()),
             mic_index=self._mic_index(self.microphone.currentData()),
             gain=self.mic_gain.value(),
+            whisper_model=str(self.whisper_model.currentData()),
         )
         self.tts.configure(
             engine=str(self.tts_engine.currentData()),
@@ -684,6 +1025,8 @@ class AssistantWindow(QWidget):
             rate=self.tts_rate.value(),
             volume=self.tts_volume.value() / 100.0,
             pitch=self.tts_pitch.value(),
+            fallback_engine=str(self.tts_fallback.currentData()),
+            profile=str(self.tts_profile.currentData()),
         )
         self._set_status("good", "Настройки применены")
 
@@ -691,6 +1034,7 @@ class AssistantWindow(QWidget):
         text = self.input.text().strip()
         if not text or self._busy:
             return
+        self.tts.stop()
         self.input.clear()
         self._append_message("user", text)
         self._process(text)
@@ -701,7 +1045,9 @@ class AssistantWindow(QWidget):
         self._set_status("warn", "Думаю…")
 
         def work() -> None:
-            result = self.core.handle_text(text)
+            result = self.core.handle_text_stream(
+                text, self.signals.stream_sentence.emit
+            )
             self.signals.result_ready.emit(result)
 
         threading.Thread(target=work, name="jarvis-command", daemon=True).start()
@@ -714,12 +1060,26 @@ class AssistantWindow(QWidget):
             meta = "модель недоступна"
         elif result.kind == "error" and result.error:
             meta = f"действие заблокировано: {result.error}"
+        elif result.kind == "streamed":
+            meta = "потоковый ответ · озвучка началась по предложениям"
         self._append_message("assistant", result.text, meta)
-        if self.tts_enabled.isChecked() and result.kind in {"answer", "fallback", "error"}:
-            self.tts.speak(result.text)
+        if self.tts_enabled.isChecked() and result.kind in {
+            "answer",
+            "fallback",
+            "error",
+            "command",
+            "confirmation",
+            "cancelled",
+        }:
+            self.tts.speak_stream(result.text)
         self._busy = False
         self.send_button.setEnabled(True)
         self._set_status("good", "Готов")
+
+    def _stream_sentence(self, sentence: str) -> None:
+        if self.tts_enabled.isChecked():
+            self.tts.speak(sentence)
+        self._set_status("warn", "Получаю ответ · озвучиваю по предложениям")
 
     def _append_message(self, role: str, text: str, meta: str = "") -> None:
         safe = html.escape(str(text)).replace("\n", "<br>")
@@ -750,6 +1110,7 @@ class AssistantWindow(QWidget):
             self.mic_button.setText("Включить микрофон")
 
     def _handle_recognized(self, text: str) -> None:
+        self.tts.stop()
         self._append_message("user", text, "голос")
         if not self._busy:
             self._process(text)
@@ -759,6 +1120,9 @@ class AssistantWindow(QWidget):
             self.mic_button.setChecked(False)
             self.mic_button.setText("Включить микрофон")
             self._set_status("bad", message)
+        elif state == "speech":
+            self.tts.stop()
+            self._set_status("warn", message)
         elif state in {"loading", "wake"}:
             self._set_status("warn", message)
         elif state == "ready":
@@ -776,6 +1140,12 @@ class AssistantWindow(QWidget):
 
     def apply_settings(self, _settings: Dict[str, Any]) -> None:
         self.core.reload()
+
+    def push_to_talk(self) -> None:
+        """Global hotkey target: interrupt speech and toggle microphone."""
+        self.tts.stop()
+        self.mic_button.setChecked(not self.mic_button.isChecked())
+        self._toggle_listening(self.mic_button.isChecked())
 
     def cleanup(self) -> None:
         self.listener.stop_listening()
